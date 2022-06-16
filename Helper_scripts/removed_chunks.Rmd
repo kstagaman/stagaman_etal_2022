@@ -1,0 +1,732 @@
+```{r subset-dbrdas, eval=FALSE}
+# set.redo.true("subsampling")
+
+both.dist.list.file <- file.path(saveDir, "list_bothSubsets_betaDiv_dist_matrices.rds")
+both.dist.list <- redo.if("subsampling", both.dist.list.file, {
+  gen.dist.matrices(ps = both.ps, methods = "all", cores = num.cores)
+})
+dissect.dist.list.file <- file.path(saveDir, "list_dissectionSubset_betaDiv_dist_matrices.rds")
+dissect.dist.list <- redo.if("subsampling", dissect.dist.list.file, {
+  gen.dist.matrices(ps = dissect.only.ps, methods = "all", cores = num.cores)
+})
+whole.dist.list.file <- file.path(saveDir, "list_wholeFishSubset_betaDiv_dist_matrices.rds")
+whole.dist.list <- redo.if("subsampling", whole.dist.list.file, {
+  gen.dist.matrices(ps = whole.only.ps, methods = "all", cores = num.cores)
+})
+
+both.dbrda.list.file <- file.path(saveDir, "list_bothSubsets_dbRDAs.rds")
+both.dbrda.list <- redo.if("subsampling", both.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- both.dist.list[[beta]]
+    capscale(
+      dist.mat ~ BaP.Treat * (Extraction.Kit + Dissect.Whole),
+      data = sample.data.frame(both.ps),
+      comm = otu.matrix(both.ps)
+    )
+  }
+  stopCluster(cl)
+  res
+})
+dissect.dbrda.list.file <- file.path(saveDir, "list_dissectionSubset_dbRDAs.rds")
+dissect.dbrda.list <- redo.if("subsampling", dissect.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- dissect.dist.list[[beta]]
+    capscale(
+      dist.mat ~ BaP.Treat * Extraction.Kit,
+      data = sample.data.frame(dissect.only.ps),
+      comm = otu.matrix(dissect.only.ps)
+    )
+  }
+  stopCluster(cl)
+  res
+})
+whole.dbrda.list.file <- file.path(saveDir, "list_wholeFishSubset_dbRDAs.rds")
+whole.dbrda.list <- redo.if("subsampling", whole.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- whole.dist.list[[beta]]
+    capscale(
+      dist.mat ~ BaP.Treat * Extraction.Kit,
+      data = sample.data.frame(whole.only.ps),
+      comm = otu.matrix(whole.only.ps)
+    )
+  }
+  stopCluster(cl)
+  res
+})
+
+both.dbrda.anovas.file <- file.path(saveDir, "list_bothSubsets_dbRDA_permanovas.rds")
+both.dbrda.anovas <- redo.if("subsampling", both.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- both.dbrda.list[[beta]]
+    anova(mod, by = "term")
+  }
+
+  stopCluster(cl)
+  res
+})
+dissect.dbrda.anovas.file <- file.path(saveDir, "list_dissectionSubset_dbRDA_permanovas.rds")
+dissect.dbrda.anovas <- redo.if("subsampling", dissect.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- dissect.dbrda.list[[beta]]
+    anova(mod, by = "term")
+  }
+
+  stopCluster(cl)
+  res
+})
+whole.dbrda.anovas.file <- file.path(saveDir, "list_wholeFishSubset_dbRDA_permanovas.rds")
+whole.dbrda.anovas <- redo.if("subsampling", whole.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- whole.dbrda.list[[beta]]
+    anova(mod, by = "term")
+  }
+
+  stopCluster(cl)
+  res
+})
+```
+
+```{r subsets-anova-print, echo=FALSE, eval=FALSE}
+cat("###### BOTH SUBSETS ######", sep = "\n")
+to.print <- lapply(beta.methods, function(beta) {
+  cat(paste("\n###", beta, "###"), sep = "\n")
+  print(both.dbrda.anovas[[beta]])
+  cat("\n##############################", sep = "\n")
+})
+
+cat("###### DISSECTED SUBSET ######", sep = "\n")
+to.print <- lapply(beta.methods, function(beta) {
+  cat(paste("\n###", beta, "###"), sep = "\n")
+  print(dissect.dbrda.anovas[[beta]])
+  cat("\n##############################", sep = "\n")
+})
+
+cat("###### WHOLE FISH SUBSET ######", sep = "\n")
+to.print <- lapply(beta.methods, function(beta) {
+  cat(paste("\n###", beta, "###"), sep = "\n")
+  print(whole.dbrda.anovas[[beta]])
+  cat("\n##############################", sep = "\n")
+})
+```
+
+```{r subset-pcoas, echo=FALSE, eval=FALSE}
+# set.redo.true("subsampling")
+
+both.pcoa.list.file <- file.path(saveDir, "list_bothSubsets_pcoas.rds")
+both.pcoa.list <- redo.if("subsampling", both.pcoa.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- both.dist.list[[beta]]
+    pcoa(dist.mat)
+  }
+
+  stopCluster(cl)
+  res
+})
+dissect.pcoa.list.file <- file.path(saveDir, "list_dissectionSubset_pcoas.rds")
+dissect.pcoa.list <- redo.if("subsampling", dissect.pcoa.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- dissect.dist.list[[beta]]
+    pcoa(dist.mat)
+  }
+
+  stopCluster(cl)
+  res
+})
+whole.pcoa.list.file <- file.path(saveDir, "list_wholeFishSubset_pcoas.rds")
+whole.pcoa.list <- redo.if("subsampling", whole.pcoa.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- whole.dist.list[[beta]]
+    pcoa(dist.mat)
+  }
+
+  stopCluster(cl)
+  res
+})
+
+both.sample.coord.dt <- NULL
+# centroid.coord.dt <- NULL
+both.axis.labels <- NULL
+both.sample.dt <- sample.data.table(both.ps) %>% setkeyv(smpl.col.name)
+beta <- beta.methods[1]
+for(beta in beta.methods) {
+  sample.coords <- both.pcoa.list[[beta]]$vectors[, 1:2] %>%
+    as.data.table(keep.rownames = smpl.col.name) %>%
+    setkeyv(smpl.col.name)
+  sample.coords[, Dist := beta]
+  both.sample.coord.dt <- rbind(
+    both.sample.coord.dt,
+    sample.coords[both.sample.dt]
+  )
+  rel.eigs <- both.pcoa.list[[beta]]$values$Relative_eig[1:2]
+  labs <- data.table(
+    Dist = beta,
+    X.lab = paste0("Axis.1 (", round(rel.eigs[1] * 100, 2), "%)"),
+    X.lab = paste0("Axis.2 (", round(rel.eigs[2] * 100, 2), "%)")
+  )
+  both.axis.labels <- rbind(both.axis.labels, labs)
+}
+both.sample.coord.dt[
+  , Dist := factor(Dist, levels = names(beta.methods)[c(1, 4, 2, 5, 3, 6)])
+]
+
+dissect.sample.coord.dt <- NULL
+# centroid.coord.dt <- NULL
+dissect.axis.labels <- NULL
+dissect.sample.dt <- sample.data.table(dissect.only.ps) %>% setkeyv(smpl.col.name)
+# beta <- beta.methods[1]
+for(beta in beta.methods) {
+  sample.coords <- dissect.pcoa.list[[beta]]$vectors[, 1:2] %>%
+    as.data.table(keep.rownames = smpl.col.name) %>%
+    setkeyv(smpl.col.name)
+  sample.coords[, Dist := beta]
+  dissect.sample.coord.dt <- rbind(
+    dissect.sample.coord.dt,
+    sample.coords[dissect.sample.dt]
+  )
+  rel.eigs <- dissect.pcoa.list[[beta]]$values$Relative_eig[1:2]
+  labs <- data.table(
+    Dist = beta,
+    X.lab = paste0("Axis.1 (", round(rel.eigs[1] * 100, 2), "%)"),
+    X.lab = paste0("Axis.2 (", round(rel.eigs[2] * 100, 2), "%)")
+  )
+  dissect.axis.labels <- rbind(dissect.axis.labels, labs)
+}
+dissect.sample.coord.dt[
+  , Dist := factor(Dist, levels = names(beta.methods)[c(1, 4, 2, 5, 3, 6)])
+]
+
+whole.sample.coord.dt <- NULL
+# centroid.coord.dt <- NULL
+whole.axis.labels <- NULL
+whole.sample.dt <- sample.data.table(whole.only.ps) %>% setkeyv(smpl.col.name)
+# beta <- beta.methods[1]
+for(beta in beta.methods) {
+  sample.coords <- whole.pcoa.list[[beta]]$vectors[, 1:2] %>%
+    as.data.table(keep.rownames = smpl.col.name) %>%
+    setkeyv(smpl.col.name)
+  sample.coords[, Dist := beta]
+  whole.sample.coord.dt <- rbind(
+    whole.sample.coord.dt,
+    sample.coords[whole.sample.dt]
+  )
+  rel.eigs <- whole.pcoa.list[[beta]]$values$Relative_eig[1:2]
+  labs <- data.table(
+    Dist = beta,
+    X.lab = paste0("Axis.1 (", round(rel.eigs[1] * 100, 2), "%)"),
+    X.lab = paste0("Axis.2 (", round(rel.eigs[2] * 100, 2), "%)")
+  )
+  whole.axis.labels <- rbind(whole.axis.labels, labs)
+}
+whole.sample.coord.dt[
+  , Dist := factor(Dist, levels = names(beta.methods)[c(1, 4, 2, 5, 3, 6)])
+]
+```
+
+```{r both-subset-pcoa-plots, echo=FALSE, fig.height=20, eval=FALSE}
+point.size <- 2.5
+label.size <- 2
+cap <- "PCoA ordinations of different distance metrics for a subset of fish (for comparison to looking at just dissected or just whole fish, to follow). Ordinations with the same distance metric label are identical in terms of sample coordinates. Different sets highlight some of the effects that were significant according to the PERMANOVA tests."
+bap.centroids <- both.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Dist")
+]
+p1 <- ggplot(both.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = bap.centroids, aes(label = BaP.Treat), size = label.size) +
+  stat_ellipse(aes(color = BaP.Treat)) +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  scale_fill_manual(values = dissect.colors) +
+  scale_color_manual(values = bap.colors) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)+
+  guides(fill = guide_legend(override.aes = list(color = dissect.colors)))
+
+kit.centroids <- both.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("Extraction.Kit", "Dist")
+]
+p2 <- ggplot(both.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = kit.centroids, aes(label = Extraction.Kit), size = label.size) +
+  stat_ellipse(aes(linetype = Extraction.Kit)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2) +
+  gg_figure_caption(caption = cap)
+
+plot_grid(p1, p2, ncol = 1)
+```
+
+```{r dissection-only-pcoa-plots, echo=FALSE, fig.height=20, eval=FALSE}
+cap <- "PCoA ordinations of different distance metrics for just dissected fish samples. Ordinations with the same distance metric label are identical in terms of sample coordinates. Different sets highlight some of the effects that were significant according to the PERMANOVA tests."
+bap.centroids <- dissect.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Dist")
+]
+p1 <- ggplot(dissect.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = bap.centroids, aes(label = BaP.Treat), size = label.size) +
+  stat_ellipse(aes(color = BaP.Treat)) +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  scale_fill_manual(values = dissect.colors[1]) +
+  scale_color_manual(values = bap.colors) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)+
+  guides(fill = guide_legend(override.aes = list(color = dissect.colors[1])))
+
+kit.centroids <- dissect.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("Extraction.Kit", "Dist")
+]
+p2 <- ggplot(dissect.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = kit.centroids, aes(label = Extraction.Kit), size = label.size) +
+  stat_ellipse(aes(linetype = Extraction.Kit)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors[1], guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2) +
+  gg_figure_caption(caption = cap)
+
+plot_grid(p1, p2, ncol = 1)
+```
+
+```{r wholeFish-only-pcoa-plots, echo=FALSE, fig.height=20, eval=FALSE}
+cap <- "PCoA ordinations of different distance metrics for just whole fish samples. Ordinations with the same distance metric label are identical in terms of sample coordinates. Different sets highlight some of the effects that were significant according to the PERMANOVA tests."
+bap.centroids <- whole.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Dist")
+]
+p1 <- ggplot(whole.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = bap.centroids, aes(label = BaP.Treat), size = label.size) +
+  stat_ellipse(aes(color = BaP.Treat)) +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  scale_fill_manual(values = dissect.colors[2]) +
+  scale_color_manual(values = bap.colors) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)+
+  guides(fill = guide_legend(override.aes = list(color = dissect.colors[2])))
+
+kit.centroids <- whole.sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("Extraction.Kit", "Dist")
+]
+p2 <- ggplot(whole.sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = kit.centroids, aes(label = Extraction.Kit), size = label.size) +
+  stat_ellipse(aes(linetype = Extraction.Kit)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors[2], guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2) +
+  gg_figure_caption(caption = cap)
+
+plot_grid(p1, p2, ncol = 1)
+```
+
+
+```{r pcoa-plots1, echo=FALSE, fig.height=36, eval=FALSE}
+point.size <- 2.5
+label.size <- 2
+p1 <- ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      shape = Extraction.Kit,
+      color = BaP.Treat
+    ),
+    size = point.size
+  ) +
+  scale_shape_manual(name = "Extraction Kit", values = c(21, 22, 24)) +
+  scale_fill_manual(name = "Dissected Gut vs. Whole Fish", values = dissect.colors) +
+  scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2) +
+  guides(fill = guide_legend(override.aes = list(color = dissect.colors)))
+
+bap.centroids <- sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Dist")
+]
+p2 <- ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = bap.centroids, aes(label = BaP.Treat), size = label.size) +
+  stat_ellipse(aes(color = BaP.Treat)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)
+
+dissect.centroids <- sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("Dissect.Whole", "Dist")
+]
+p3 <- ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = dissect.centroids, aes(label = Dissect.Whole), size = label.size) +
+  stat_ellipse(aes(color = Dissect.Whole)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = c(bap.colors, dissect.colors), guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)
+
+kit.centroids <- sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("Extraction.Kit", "Dist")
+]
+p4 <- ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(data = kit.centroids, aes(label = Extraction.Kit), size = label.size) +
+  stat_ellipse(aes(linetype = Extraction.Kit), show.legend = F) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)
+
+plot_grid(p1, p2, p3, p4, ncol = 1)
+```
+
+```{r pcoa-plots2, echo=FALSE, fig.height=12, eval=FALSE}
+bap.by.kit.centroids <- sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Extraction.Kit", "Dist")
+]
+ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(
+    data = bap.by.kit.centroids,
+    aes(label = interaction(BaP.Treat, Extraction.Kit)),
+    size = label.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Extraction.Kit)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2)
+```
+
+```{r pcoa-plots3, echo=FALSE, fig.height=12, eval=FALSE}
+cap <- "PCoA ordinations of different distance metrics. Ordinations with the same distance metric label are identical in terms of sample coordinates. Different sets highlight some of the interactions that were significant according to the PERMANOVA tests."
+bap.by.dissect.centroids <- sample.coord.dt[
+  ,
+  .(Axis.1 = mean(Axis.1), Axis.2 = mean(Axis.2)),
+  by = c("BaP.Treat", "Dissect.Whole", "Dist")
+]
+ggplot(sample.coord.dt, aes(x = Axis.1, y = Axis.2)) +
+  geom_point(
+    aes(
+      fill = Dissect.Whole,
+      color = BaP.Treat,
+      shape = Extraction.Kit
+    ),
+    size = point.size
+  ) +
+  geom_label(
+    data = bap.by.dissect.centroids,
+    aes(label = interaction(BaP.Treat, Dissect.Whole)),
+    size = label.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Dissect.Whole)) +
+  scale_shape_manual(values = c(21, 22, 24), guide = F) +
+  scale_fill_manual(values = dissect.colors, guide = F) +
+  scale_color_manual(values = bap.colors, guide = F) +
+  scale_linetype_manual(values = c(2, 1)) +
+  facet_wrap(~ Dist, scales = "free", ncol = 2) +
+  gg_figure_caption(caption = cap)
+```
+```{r pcoa-gen}
+pcoa.list.file <- file.path(saveDir, "list_pcoas.rds")
+pcoa.list <- redo.if("pcoas", pcoa.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- dist.list[[beta]] %>%
+      dist_subset(idx = sample_names(all.kits.ps))
+    pcoa(dist.mat)
+  }
+
+  stopCluster(cl)
+  res
+})
+
+sample.coord.dt <- NULL
+# centroid.coord.dt <- NULL
+axis.labels <- NULL
+all.kits.smpl.dt <- sample.data.table(all.kits.ps) %>% setkeyv(smpl.col.name)
+# beta <- beta.methods[1]
+for(beta in beta.methods) {
+  sample.coords <- pcoa.list[[beta]]$vectors[, 1:2] %>%
+    as.data.table(keep.rownames = smpl.col.name) %>%
+    setkeyv(smpl.col.name)
+  sample.coords[, Dist := beta]
+  sample.coord.dt <- rbind(
+    sample.coord.dt,
+    sample.coords[all.kits.smpl.dt]
+  )
+  rel.eigs <- pcoa.list[[beta]]$values$Relative_eig[1:2]
+  labs <- data.table(
+    Dist = beta,
+    X.lab = paste0("Axis.1 (", round(rel.eigs[1] * 100, 2), "%)"),
+    Y.lab = paste0("Axis.2 (", round(rel.eigs[2] * 100, 2), "%)")
+  )
+  axis.labels <- rbind(axis.labels, labs)
+}
+sample.coord.dt[
+  , Dist := factor(Dist, levels = names(beta.methods)[c(1, 4, 2, 5, 3, 6)])
+]
+```
+
+```{r random-forest-dms-importance-table, echo=FALSE, results='asis', eval=FALSE}
+gt(
+  sig.impt.taxa.dt[order(Dissect.Importance, Whole.Importance, decreasing = T)],
+  rowname_col = "ASV"
+) %>%
+  tab_header(title = "Signficantly important taxa from random forest models predicition BaP treatment from just dissected gut or whole fish.") %>%
+  fmt_number(columns = 2:5, decimals = 3) # %>%
+# as_raw_html()
+```
+
+```{r logit-glm-dmsTogether}
+asvs.dt <- otu.data.table(all.kits.ps) %>% setkeyv(smpl.col.name)
+smpl.dt <- sample.data.table(all.kits.ps) %>% setkeyv(smpl.col.name)
+mod.dt <- smpl.dt[asvs.dt]
+set.seed(user.seed)
+
+glm.res.dt.file <- file.path(
+  saveDir,
+  "dt_subsampled_sigImpt_ASVs_logitGLM_results_DMsTogether.rds"
+)
+glm.dmsTog.res.dt <- redo.if("subsampling", glm.res.dt.file, {
+  ASVs <- sig.impt.taxa.dt[order(Dissect.Importance, decreasing = T)]$ASV
+  idx <- 1
+  glm0 <-  glm(
+    as.formula(paste("BaP.Treat ~", ASVs[idx])),
+    family = "binomial",
+    data = mod.dt
+  )
+  p.value <- tidy(glm0)$p.value[2]
+  while(p.value > 0.05 & idx < length(ASVs)) {
+    idx <- idx + 1
+    glm0 <-  glm(
+      as.formula(paste("BaP.Treat ~", ASVs[idx])),
+      family = "binomial",
+      data = mod.dt
+    )
+    p.value <- tidy(glm0)$p.value[2]
+  }
+
+  curr.glm <- glm0
+  for (i in (idx + 1):length(ASVs)) {
+    cat(i, sep = "\n")
+    new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+    new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+    if (is.na(new.p)) {
+      next
+    } else {
+      if (new.p <= 0.05) {
+        curr.glm <- new.glm
+      } else {
+        next
+      }
+    }
+  }
+  Anova(curr.glm, type = 2) %>%
+    tidy() %>%
+    mutate(data.set = "dissected + whole fish", .before = 1) %>%
+    as.data.table() %>%
+    setkeyv("term")
+})
+```
+
+
+```{r logit-glms-kitsTogether}
+asvs.dt <- otu.data.table(all.kits.ps) %>% setkeyv(smpl.col.name)
+smpl.dt <- sample.data.table(all.kits.ps) %>% setkeyv(smpl.col.name)
+set.seed(user.seed)
+glm.res.dt.file <- file.path(
+  saveDir,
+  "dt_subsampled_sigImpt_ASVs_logitGLM_results_kitsTogether.rds"
+)
+sig.impt.taxa.dt[, Mean.Rank := (BT.Impt.Rank + NS.Impt.Rank + PS.Impt.Rank) / 3]
+glm.kitsTog.res.dt <- redo.if("subsampling", glm.res.dt.file, {
+  ASVs <- sig.impt.taxa.dt[order(Mean.Rank, decreasing = F)]$ASV
+  idx <- 1
+  glm0 <-  glm(
+    as.formula(paste("BaP.Treat ~", ASVs[idx])),
+    family = "binomial",
+    data = mod.dt
+  )
+  p.value <- tidy(glm0)$p.value[2]
+  while(p.value > 0.05 & idx < length(ASVs)) {
+    idx <- idx + 1
+    glm0 <-  glm(
+      as.formula(paste("BaP.Treat ~", ASVs[idx])),
+      family = "binomial",
+      data = mod.dt
+    )
+    p.value <- tidy(glm0)$p.value[2]
+  }
+
+  curr.glm <- glm0
+  for (i in (idx + 1):length(ASVs)) {
+    cat(i, sep = "\n")
+    new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+    new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+    if (is.na(new.p)) {
+      next
+    } else {
+      if (new.p <= 0.05) {
+        curr.glm <- new.glm
+      } else {
+        next
+      }
+    }
+  }
+  Anova(curr.glm, type = 2) %>%
+    tidy() %>%
+    mutate(data.set = "all kits", .before = 1) %>%
+    as.data.table() %>%
+    setkeyv("term")
+})
+```
+

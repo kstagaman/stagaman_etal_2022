@@ -1,0 +1,3065 @@
+---
+title: "Effects of different dissection, DNA extraction kit, and PCR methods on assessing the effect of exposure to an environmental toxicant on the zebrafish microbiome"
+author: "Kasschau, Stagaman, Sharpton"
+date: "2021-04"
+output:
+  word_document: default
+  html_document: default
+  github_document: default
+always_allow_html: yes
+---
+
+<style>
+caption {
+font-size: 0.8em;
+font-weight: 500;
+text-align: left;
+}
+</style>
+
+```{r setup, include=FALSE}
+max.cores <- 120
+dirs <- list(
+  scripts = "Helper_scripts",
+  save = "Saved_objects",
+  input = "Input",
+  plots = "Plots"
+)
+dirs$lefse <- file.path(dirs$save, "LEfSe")
+dirs$main.figs <- file.path(dirs$plots, "Main_figures")
+dirs$supp.figs <- file.path(dirs$plots, "Supplemental_figures")
+create <- lapply(dirs, function(dir) {
+  if (!dir.exists(dir)) { dir.create(dir) }
+})
+
+knitr::opts_chunk$set(
+  echo = FALSE, 
+  dpi = 150, 
+  cache = FALSE, 
+  message = FALSE,
+  warning = FALSE
+)
+source(file.path(dirs$scripts, "packages_sources.R"))
+theme_set(theme_cowplot())
+source(file.path(dirs$scripts, "my_cowplot_tweaks.R"))
+options(knitr.kable.NA = '')
+dark2.pal <- brewer.pal(8, "Dark2")
+blues.pal <- brewer.pal(9, "Blues")
+fig.wd <- 8
+fig.ht <- 8
+fig.dpi <- 300
+fig.ext <- ".pdf"
+
+redo.vars <- c(
+  "rarefaction", 
+  "clr",
+  "distance.matrices", 
+  "glmer", 
+  "logitGLMs",
+  "dbrdas", 
+  "pcoas", 
+  "subsampling",
+  "lefse.heatmap"
+)
+assign.redo(redo.vars, state = F)
+
+num.cores <- ifelse(str_detect(getwd(), "stagamak"), max.cores, 3)
+user.seed <- 42
+rarefaction.minimum <- 10000
+alpha.methods <- c("Chao1", "Shannon", "Simpson", "Phylogenetic", "Observed") %>% 
+  set_names()
+smpl.col.name <- "Sample"
+dissect.colors <- c(blues.pal[5], "black")
+bap.colors <- dark2.pal[1:2]
+
+setDTthreads(num.cores)
+ps0 <- readRDS(file.path(dirs$input, "phyloseq.rds"))
+
+min.smpl.size <- min(
+  sample_sums(ps0)[sample_sums(ps0) >= rarefaction.minimum]
+)
+
+ps.file <- file.path(dirs$save, "ps_rarefied.rds")
+ps <- redo.if("rarefaction", ps.file, {
+  ps.rar <- rarefy_even_depth(
+    physeq = ps0, 
+    sample.size = min.smpl.size,
+    trimOTUs = TRUE,
+    rngseed = user.seed
+  ) %>% 
+    subset_taxa(
+      !is.na(Kingdom) & 
+        Kingdom != "Eukaryota" &
+        Order != "Chloroplast" &
+        Family != "Mitochondria"
+    )
+  rename.NA.taxa(ps.rar)
+})
+# table(taxa.data.table(ps)$Kingdom)
+ps@sam_data$BaP.Treat <- factor(
+  ps@sam_data$BaP.Treat, 
+  levels = c("control", "BaP")
+)
+sample.dt <- sample.data.table(ps) %>% setkeyv(smpl.col.name)
+sample.df <- sample.data.frame(ps)
+
+ps.clr.file <- file.path(dirs$save, "ps_centerLogRatio_transformed.rds")
+ps.clr <- redo.if("clr", ps.clr.file, {
+  source(file.path(dirs$scripts, "gen_clr_matrix.R"))
+  clr.mat <- gen.clr.matrix(asv.mat = otu.matrix(ps0), min_reads = min.smpl.size)
+  ps.clr <- prune_taxa(colnames(clr.mat), ps0)
+  otu_table(ps.clr) <- otu_table(clr.mat, taxa_are_rows = F)
+  rename.NA.taxa(ps.clr)
+})
+ps.clr@sam_data$BaP.Treat <- factor(
+  ps.clr@sam_data$BaP.Treat, 
+  levels = c("control", "BaP")
+)
+
+
+dist.list.file <- file.path(dirs$save, "list_betaDiv_dist_matrices.rds")
+dist.list <- redo.if("rarefaction", dist.list.file, {
+  gen.dist.matrices(
+    ps = ps, 
+    methods = "all", 
+    clr_ps = ps.clr,
+    cores = num.cores
+  )
+})
+beta.methods.all <- names(dist.list) %>% set_names()
+beta.methods <- beta.methods.all[-4]
+# 
+# clr.dist.file <- file.path(dirs$save, "dist_matrix_CLR_aitchison.rds")
+# clr.dist <- redo.if("clr", clr.dist.file, {
+#   vegdist(otu.matrix(ps.clr), method = "euclidean")
+# })
+
+alpha.base.file <- file.path(dirs$save, "dt_alphaDiv_metrics.rds")
+alpha.base <- redo.if("rarefaction", alpha.base.file, {
+  tax.dt <- estimate_richness(
+    physeq = ps,
+    measures = alpha.methods[1:3]
+  ) %>% as.data.table(keep.rownames = smpl.col.name) %>% setkeyv(smpl.col.name)
+  tax.dt[, se.chao1 := NULL]
+  
+  phy.dt <- pd(samp = otu.matrix(ps), tree = phy_tree(ps)) %>% 
+    as.data.table(keep.rownames = smpl.col.name) %>% 
+    setkeyv(smpl.col.name)
+  names(phy.dt)[2:3] <- alpha.methods[4:5]
+  tax.dt[phy.dt]
+})
+
+beta.setNames <- function(x) {setNames(x, beta.methods)}
+my.mean <- function(...) {mean(c(...), na.rm = T, trim = 0)}
+
+data.ids <- list(
+  DMs = set_names(c("dissected", "whole fish")),
+  EKs = set_names(sort(unique(sample.dt$Extraction.Kit))),
+  PCR = set_names(c("PCRx1", "PCRx3"))
+)
+```
+
+```{r sample-ns, include=FALSE}
+length(unique(sample.dt$OriginID))
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat)] 
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(Dissect.Whole, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(Dissect.Whole)] 
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(Extraction.Kit)] 
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole)]
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Extraction.Kit)]
+
+sample.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole, Extraction.Kit)]
+```
+
+
+## Introduction
+
+Zebrafish (*Danio rerio*) have become an increasingly popular model organism for the study of the gut microbiome. Their advantages as a model organism include the high numbers that can be produced, the rapid maturation, detailed knowledge of biological development, and ease of germ free derivation, relative to many other models. Perhaps because of the rapid growth in popularity of zebrafish as a model organism, due to these listed factors, there has not been a consistent set of methods used across studies for assessing the composition and diversity of the zebrafish gut microbiome. In particular, different researchers will either extract DNA either from whole fish carcasses or extracted intestinal tissue, use different DNA extraction kits, and follow different PCR protocols (namely using single or triplicate PCR replication). In order to assess the effects these different methods have on determining the effects of an experimental treatement on the gut microbiome, we exposed 384 fish to either 10 µM benzo[*a*]pyrene (B*a*P) or an embryo medium (water plus salts) control and assessed how disseciton method, DNA extraction kit type, and PCR replication affected our assessment of B*a*P exposure on the zebrafish gut microbiome diversity and composition.
+
+## Experimental methods
+
+All fish embryos were collected on the same day. A single embryo was added to each well of a 96 well plate for 4 total plates and maintain there for the duration of the experiment. At 9 days post fertilization (dpf) we dissected out the intestines from half the larval fish and kept the whole carcasses of the remaining half. Randomizing across plates and dissection method, we then used three different kits to extract DNA, and we amplified the V4 region of the 16S rDNA gene using both a single reaction and triplicate reactions per sample (to make direct comparisons). 
+
+## Statistical methods
+
+### Alpha-diversity
+
+We used the functions `descdist` and `fitdist` (`fitdistrplus` package) to determine that the best distribution for the alpha-diversity metric scores were almost always the beta distribution. This distribution is not directly supported by the `glm` function but is approximated by the `quasibinomial` family, which we used. These distributions only take values from 0 to 1, so we divided all alpha-diversity scores by the max score for each metric. Because nearly all samples underwent both single and triplicate PCR, we first assessed whether there was a statistical interactin between B*a*P treatment and PCR method using a generalized linear mixed effects model (`glmer.nb`) with the zebrafish sample ID as a random factor. For the remaining analyses, in order to not artificially inflate our sample size with redundant samples, we randomly chose a single- or triplicate-PCR sample as a representative for each zebrafish sample. Furthermore, we subsampled down to the minimum number of samples for each treatment so more direct comparisons could be made between treatments.
+
+### Beta-diversity
+
+To assess differences in microbiome composition between samples (beta-diversity), we generated distance matrices for all samples using six different distance metrics: Bray-Curtis, Canberra, Sørensen, weighted UniFrac, half-weighted UniFrac, and unweighted UniFrac (FUNCTIONS/PACKAGES). Using these distance matrices, we built full dbRDA models (function `capscale` from the `vegan` package) and then assessed significance with `anova.cca` (a PERMANOVA model; `vegan` package). We used we used the function `get.biplot.data` from the `phyloseqCompanion` and `ggplot` (`ggplot2` package) create ordinations based off of the various distance metrics we used. As with alpha-diversity, we first tested the effect of PCR method using a PERMANOVA model wherein we used zebrafish sample ID as a blocking factor (permutations only occurred within each ID rather than across all samples), a non-parametric analog for a random factor in a parametric test. We then proceeded with the same sub-sampled sets from the alpha-diversity analyses.
+
+### Taxonomic indicator analyses
+
+We used LEfSe as implemented in galaxy on the Huttenhower lab website to determine which taxa were statistically significant indicators of B*a*P exposure in our various subsets. We compared dissected vs whole fish, and each extraction kit. All analyses were run with the default parameters with B*a*P treatment as class and sample ID as subject.
+
+### Random Forest Analyses
+
+As with LEfSe, we generated random forest models for each subset (dissection methods and extraction kits) using the `caret` package for training the model and the `ranger` package for implementation of the random forest method. Prior to running the random forest model, we removed taxa with near-zero variation using the `step_nzv` function (`recipes` package). We used 5-fold cross validation and the ROC metric for choosing the best model. The function `roc` (`pROC` package) was used for calculating the ROC curves of the final models and these data were used for plotting with `ggplot`. Importance values for all taxa in the random forest models were calculated during model training and significance of the importance values was determined using the permutation approach {Altmann et al. (2010)}. 
+
+### Logistic Regressions
+
+Taxa deemed significantly important in each random forest model were then used to build logistic regression models to predict B*a*P exposure from their relative abundances. Models were built in forward step-wise manners, starting with the most important taxa from each model. Models were built with the `glm` function and each new model was compared to the previous with `anova` (both functions from the bases stats package). New models (i.e. models with an additional term) that were statistically better than the previous model were kept as the current model, models that were not significantly better were discarded). Taxa that were assessed as significantly predicting B*a*P exposure in the final model (`Anova` from the `car` package with type II tests).
+
+## Alpha-diversity results
+
+```{r alpha-diversity-stats}
+# library(fitdistrplus)
+
+model.data.base <- copy(alpha.base)
+# alpha <- alpha.methods[2]
+for (alpha in alpha.methods) {
+  if (ad.test(alpha.base[[alpha]])$p.value <= 0.05) {
+    trans <- transformTukey(
+      alpha.base[[alpha]], 
+      plotit = F, 
+      quiet = T, 
+      statistic = 2
+    )
+    if (ad.test(trans)$p.value > 0.01) {
+      model.data.base[[alpha]] <- trans
+    } else {
+      model.data.base[[alpha]] <- model.data.base[[alpha]] / 
+        max(model.data.base[[alpha]])
+    }
+  }
+}
+# setkey(model.data.base, Sample)
+# vec <- alpha.base[[alpha.methods[2]]]
+# descdist(vec, discrete = T)
+# fit.nb <- fitdist(vec, "nbinom")
+```
+
+```{r alpha-pcr-glms-print}
+model.data <- sample.dt[model.data.base] %>% setkeyv("Sample")
+methods <- alpha.methods[alpha.methods %in% names(model.data)]
+
+alpha.pcr.glmer.file <- file.path(dirs$save, "kable_alpha_PCR_glmer_res.rds")
+alpha.pcr.glmer.res <- redo.if("glmer", alpha.pcr.glmer.file, {
+  lapply(methods, function(alpha) {
+    frm <- paste(
+      alpha, "~ BaP.Treat * Single.Triplicate + (1 | OriginID)"
+    )
+    mod <- lme4::glmer.nb(as.formula(frm), data = model.data)
+    return(
+      Anova(mod, type = 2) %>% 
+        tidy() %>% 
+        mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+        mutate(metric = alpha, .before = 1)
+    )
+  }) %>%
+    bind_rows()
+})
+cap <- paste0(
+  "Alpha-diversity by PCR method MM-GLM results (n = ", 
+  length(unique(model.data$OriginID)), ")"
+)
+
+table.file <- file.path(
+  dirs$supp.figs, 
+  paste0("suppTbl_", tracking.env$supp.tbl.count + 1, "_alpha_by_pcr_stats.html")
+)
+alpha.pcr.glmer.res %>%
+  mutate(
+    term = stri_replace_all_fixed(
+      term,
+      pattern = c("BaP.Treat", "Single.Triplicate"), 
+      replacement = c("BaP Treatment", "PCR Method"),
+      vectorize_all = FALSE
+    )
+  ) %>% 
+  flextable() %>%
+  set_caption(caption = supp.tbl.caption(cap)) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+```{r}
+alpha.all.glmer.file <- file.path(dirs$save, "alpha_all_glmer_res.rds")
+alpha.all.glmer.res <- redo.if("glmer", alpha.all.glmer.file, {
+  lapply(methods, function(alpha) {
+    frm <- paste(
+      alpha, 
+      "~ BaP.Treat * (Dissect.Whole + Extraction.Kit + Single.Triplicate) + (Single.Triplicate | OriginID)"
+    )
+    mod <- lme4::glmer.nb(as.formula(frm), data = model.data)
+    summary(mod)
+    return(
+      Anova(mod, type = 2) %>% 
+        tidy() %>% 
+        mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+        mutate(metric = alpha, .before = 1)
+    )
+  }) %>%
+    bind_rows()
+})
+
+alpha.all.alt.glmer.file <- file.path(
+  dirs$save, 
+  "alpha_all_alt_glmer_res.rds"
+)
+alpha.all.alt.glmer.res <- redo.if("glmer", alpha.all.alt.glmer.file, {
+  lapply(methods, function(alpha) {
+    frm <- paste(
+      alpha, 
+      "~ BaP.Treat * (Dissect.Whole + Extraction.Kit + Single.Triplicate) + (1 | OriginID)"
+    )
+    mod <- lme4::glmer.nb(as.formula(frm), data = model.data)
+    summary(mod)
+    return(
+      Anova(mod, type = 2) %>% 
+        tidy() %>% 
+        mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+        mutate(metric = alpha, .before = 1)
+    )
+  }) %>%
+    bind_rows()
+})
+```
+
+
+There were no statistically significant effects of single vs triplicate PCR reactions on the relationship between B*a*P treatment and any metric of alpha-diversity (Table 1). Samples treated with B*a*P exhibited consitently higher alpha-diversity scores, regardless of PCR method (Figure 1).
+
+```{r alpha-pcr-plot, fig.height=8, fig.width=4}
+alpha.dt <- melt(
+  model.data,
+  measure.vars = alpha.methods, 
+  variable.name = "Alpha.Metric", 
+  value.name = "Score"
+)
+plot.file <- file.path(
+  dirs$supp.figs, 
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1,
+    "_alpha_by_pcr_plot",
+    fig.ext
+  )
+)
+cap <- "Plot of scaled [0, 1] alpha-diversity scores by PCR methods."
+alpha.pcr.plot <- ggplot(alpha.dt, aes(x = Single.Triplicate, y = Score)) +
+  geom_boxplot(aes(color = BaP.Treat)) + 
+  facet_grid(Alpha.Metric ~ BaP.Treat, scales = "free_y") +
+  scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+  labs(x = "PCR Method")
+
+alpha.pcr.plot +
+  labs(caption = cap, caption.width = 40)
+
+ggsave(
+  alpha.pcr.plot, 
+  filename = plot.file,
+  width = fig.wd,
+  height = fig.ht * 1.2,
+  dpi = fig.dpi
+)
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+Because nearly all samples went through both single and triplicate PCR, we needed to make sure we were not artificially increasing our sample size by including both PCR reactions as separate, independent samples. In order to do this, we randomly chose a single or triplicate PCR reaction sample to represent each actual zebrafish microbiome sample. We also subsampled so that, in our comparisons we had an equal number of samples from each kit and each dissection method. 
+
+```{r subset-dissection-methods}
+subset.to <- sample.dt[
+  , .(Group = .GRP), 
+  by = .(Dissect.Whole, BaP.Treat, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(Dissect.Whole, BaP.Treat)] %>%
+  use_series("Count") %>%
+  min() %>%
+  floor()
+set.seed(user.seed)
+random.dms.subsample <- function(dt, cat1, cat2, subset_to) {
+  return(
+    dt[Dissect.Whole == cat1 & BaP.Treat == cat2] %>%
+      use_series("OriginID") %>%
+      unique() %>%
+      sample(size = subset_to) %>%
+      sapply(function(origin) {
+        sample(dt[OriginID == origin]$Sample, size = 1)
+      }) %>% unname()
+  )
+}
+dm.smpl.names <- NULL
+for (dm in data.ids$DMs) {
+  for (bap.treat in c("control", "BaP")) {
+    dm.smpl.names[[paste(dm, bap.treat, sep = "-")]] <- random.dms.subsample(
+      dt = sample.dt,
+      cat1 = dm,
+      cat2 = bap.treat,
+      subset_to = subset.to
+    )
+  }
+}
+
+dissect.only.ps <- dm.smpl.names %>% 
+  .[str_detect(names(.), "dissected")] %>%
+  unlist() %>%
+  prune_samples(ps)
+whole.only.ps <- dm.smpl.names %>% 
+  .[str_detect(names(.), "whole")] %>%
+  unlist() %>%
+  prune_samples(ps)
+
+dissect.only.clr.ps <- dm.smpl.names %>% 
+  .[str_detect(names(.), "dissected")] %>%
+  unlist() %>%
+  prune_samples(ps.clr)
+whole.only.clr.ps <- dm.smpl.names %>% 
+  .[str_detect(names(.), "whole")] %>%
+  unlist() %>%
+  prune_samples(ps.clr)
+
+dm.ps.list <- list(dissect.only.ps, whole.only.ps) %>% set_names(data.ids$DMs)
+dm.clr.ps.list <- list(dissect.only.clr.ps, whole.only.clr.ps) %>%
+  set_names(data.ids$DMs)
+
+all.dms.ps <- do.call(merge_phyloseq, dm.ps.list)
+all.dms.smpl.dt <- sample.data.table(all.dms.ps)
+all.dms.smpl.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole)] 
+all.dms.smpl.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole, Extraction.Kit)] 
+
+all.dms.clr.ps <- do.call(merge_phyloseq, dm.clr.ps.list)
+all.dms.smpl.clr.dt <- sample.data.table(all.dms.clr.ps)
+
+
+dissect.only.ps <- dissect.only.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+whole.only.ps <- whole.only.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+dissect.smpl.dt <- sample.data.table(dissect.only.ps) %>% setkeyv(smpl.col.name)
+# dissect.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+whole.smpl.dt <- sample.data.table(whole.only.ps) %>% setkeyv(smpl.col.name)
+# whole.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+dissect.asvs.dt <- otu.data.table(dissect.only.ps) %>% setkeyv(smpl.col.name)
+whole.asvs.dt <- otu.data.table(whole.only.ps) %>% setkeyv(smpl.col.name)
+
+dissect.only.clr.ps <- dissect.only.clr.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+whole.only.clr.ps <- whole.only.clr.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+dissect.clr.smpl.dt <- sample.data.table(dissect.only.clr.ps) %>% 
+  setkeyv(smpl.col.name)
+# dissect.clr.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+whole.clr.smpl.dt <- sample.data.table(whole.only.clr.ps) %>% 
+  setkeyv(smpl.col.name)
+# whole.clr.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+dissect.clr.asvs.dt <- otu.data.table(dissect.only.clr.ps) %>% 
+  setkeyv(smpl.col.name)
+whole.clr.asvs.dt <- otu.data.table(whole.only.clr.ps) %>% 
+  setkeyv(smpl.col.name)
+```
+
+```{r subset-extraction-kits}
+subset.to <- sample.dt[
+  , .(Group = .GRP), 
+  by = .(Extraction.Kit, BaP.Treat, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(Extraction.Kit, BaP.Treat)] %>%
+  use_series("Count") %>%
+  min() %>%
+  floor()
+set.seed(user.seed)
+random.kits.subsample <- function(dt, cat1, cat2, subset_to) {
+  return(
+    dt[Extraction.Kit == cat1 & BaP.Treat == cat2] %>%
+      use_series("OriginID") %>%
+      unique() %>%
+      sample(size = subset_to) %>%
+      sapply(function(origin) {
+        sample(dt[OriginID == origin]$Sample, size = 1)
+      }) %>% unname()
+  )
+}
+kit.smpl.names <- NULL
+for (kit in data.ids$EKs) {
+  for (bap.treat in c("control", "BaP")) {
+    kit.smpl.names[[paste(kit, bap.treat, sep = "-")]] <- random.kits.subsample(
+      dt = sample.dt,
+      cat1 = kit,
+      cat2 = bap.treat,
+      subset_to = subset.to
+    )
+  }
+}
+
+bt.only.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Blood")] %>%
+  unlist() %>%
+  prune_samples(ps)
+ns.only.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Nucleo")] %>%
+  unlist() %>%
+  prune_samples(ps)
+ps.only.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Power")] %>%
+  unlist() %>%
+  prune_samples(ps)
+
+
+bt.only.clr.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Blood")] %>%
+  unlist() %>%
+  prune_samples(ps.clr)
+ns.only.clr.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Nucleo")] %>%
+  unlist() %>%
+  prune_samples(ps.clr)
+ps.only.clr.ps <- kit.smpl.names %>% 
+  .[str_detect(names(.), "Power")] %>%
+  unlist() %>%
+  prune_samples(ps.clr)
+
+kit.ps.list <- list(bt.only.ps, ns.only.ps, ps.only.ps) %>% 
+  set_names(data.ids$EKs)
+kit.clr.ps.list <- list(bt.only.clr.ps, ns.only.clr.ps, ps.only.clr.ps) %>% 
+  set_names(data.ids$EKs)
+
+all.kits.ps <- do.call(merge_phyloseq, kit.ps.list)
+all.kits.smpl.dt <- sample.data.table(all.kits.ps)
+all.kits.smpl.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Extraction.Kit)] 
+all.kits.smpl.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole, Extraction.Kit)] %>%
+  .[order(BaP.Treat, Dissect.Whole, Extraction.Kit)]
+
+all.kits.clr.ps <- do.call(merge_phyloseq, kit.clr.ps.list)
+
+bt.only.ps <- bt.only.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+ns.only.ps <- ns.only.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+ps.only.ps <- ps.only.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+bt.smpl.dt <- sample.data.table(bt.only.ps) %>% setkeyv(smpl.col.name)
+ns.smpl.dt <- sample.data.table(ns.only.ps) %>% setkeyv(smpl.col.name)
+ps.smpl.dt <- sample.data.table(ps.only.ps) %>% setkeyv(smpl.col.name)
+bt.asvs.dt <- otu.data.table(bt.only.ps) %>% setkeyv(smpl.col.name)
+ns.asvs.dt <- otu.data.table(ns.only.ps) %>% setkeyv(smpl.col.name)
+ps.asvs.dt <- otu.data.table(ps.only.ps) %>% setkeyv(smpl.col.name)
+
+# bt.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+# ns.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+# ps.smpl.dt[, .(N = .N), by = "Single.Triplicate"]
+
+
+bt.only.clr.ps <- bt.only.clr.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+ns.only.clr.ps <- ns.only.clr.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+ps.only.clr.ps <- ps.only.clr.ps %>% prune_taxa(taxa_sums(.) > 0, .)
+bt.clr.smpl.dt <- sample.data.table(bt.only.ps) %>% setkeyv(smpl.col.name)
+ns.clr.smpl.dt <- sample.data.table(ns.only.ps) %>% setkeyv(smpl.col.name)
+ps.clr.smpl.dt <- sample.data.table(ps.only.ps) %>% setkeyv(smpl.col.name)
+bt.clr.asvs.dt <- otu.data.table(bt.only.ps) %>% setkeyv(smpl.col.name)
+ns.clr.asvs.dt <- otu.data.table(ns.only.ps) %>% setkeyv(smpl.col.name)
+ps.clr.asvs.dt <- otu.data.table(ps.only.ps) %>% setkeyv(smpl.col.name)
+```
+
+```{r subset-dms-and-eks}
+subset.to <- sample.dt[
+  , .(Group = .GRP), 
+  by = .(Dissect.Whole, Extraction.Kit, BaP.Treat, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(Dissect.Whole, Extraction.Kit, BaP.Treat)] %>%
+  use_series("Count") %>%
+  min() %>%
+  floor()
+set.seed(user.seed)
+random.subsample <- function(dt, cat1, cat2, cat3, subset_to) {
+  return(
+    dt[Dissect.Whole == cat1 & Extraction.Kit == cat2 & BaP.Treat == cat3] %>%
+      use_series("OriginID") %>%
+      unique() %>%
+      sample(size = subset_to) %>%
+      sapply(function(origin) {
+        sample(dt[OriginID == origin]$Sample, size = 1)
+      }) %>% unname()
+  )
+}
+subset.smpl.names <- NULL
+for (dm in data.ids$DMs) {
+  for (kit in data.ids$EKs) {
+    for (bap.treat in c("control", "BaP")) {
+      subset.smpl.names[[paste(dm, kit, bap.treat, sep = "-")]] <- random.subsample(
+        dt = sample.dt,
+        cat1 = dm,
+        cat2 = kit,
+        cat3 = bap.treat,
+        subset_to = subset.to
+      )
+    }
+  }
+}
+
+full.subsmpl.ps <- prune_samples(samples = unlist(subset.smpl.names), ps) %>%
+  prune_taxa(taxa_sums(.) > 0, .)
+full.subsmpl.smpl.dt <- sample.data.table(full.subsmpl.ps, sample.column.name = F) %>% 
+  merge(model.data.base, by = "Sample", all.x = T) %>%
+  setkeyv(smpl.col.name)
+full.subsmpl.asv.dt <- otu.data.table(full.subsmpl.ps) %>% setkeyv(smpl.col.name)
+full.subsmpl.smpl.dt[
+  , .(Group = .GRP), 
+  by = .(BaP.Treat, Dissect.Whole, Extraction.Kit, OriginID)
+] %>%
+  .[, .(Count = .N), by = .(BaP.Treat, Dissect.Whole, Extraction.Kit)] %>%
+  .[order(BaP.Treat, Dissect.Whole, Extraction.Kit)]
+```
+
+```{r alpha-EKandDM-glms-print}
+table.file <- file.path(
+  dirs$supp.figs, 
+  paste0(
+    "suppTbl_", tracking.env$supp.tbl.count + 1,"_alpha_by_EKandDM_stats.html"
+  )
+)
+lapply(methods, function(alpha) {
+  full.frm <- paste(
+    alpha, "~ BaP.Treat * (Extraction.Kit + Dissect.Whole)"
+  )
+  full.mod <- glm(
+    as.formula(full.frm), 
+    # data = model.data[sample_names(all.kits.ps)], 
+    data = full.subsmpl.smpl.dt,
+    family = "quasibinomial"
+  )
+  return(
+    Anova(full.mod, type = 2) %>% 
+      tidy() %>% 
+      mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+      mutate(metric = alpha, .before = 1)
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    term = stri_replace_all_fixed(
+      term,
+      pattern = c("BaP.Treat", "Extraction.Kit", "Dissect.Whole"), 
+      replacement = c("BaP Treatment", "Extraction Kit", "Dissection Method"),
+      vectorize_all = FALSE
+    )
+  ) %>%
+  flextable() %>%
+  set_caption(
+    caption = supp.tbl.caption(
+      paste0(
+        "Alpha-diversity by extraction kit and 
+        dissection method GLM results (n = ",
+        nsamples(full.subsmpl.ps), ")"
+      )
+    )
+  ) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>% 
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+While there were significant main effects of B*a*P treatment, DNA extraction kit, and dissection method, only for Chao1 and Observed taxa were there significant interactions between extraction kit and B*a*P treatment (Table 2). This implies that, while extraction kits and dissection methods influence the measurement of microbiome diversity, they do not generally do so in a manner would alter our interpretation of how B*a*P treatment affect microbiome diversity. As noted with the PCR methods analysis, B*a*P treatment appears to increase measured alpha-diversity regardless of methods used (Figure 2). 
+
+```{r alpha-EKandDM-plot, fig.height=8, fig.width=4}
+alpha.equalized.dt <- melt(
+  model.data[sample_names(all.kits.ps)],
+  measure.vars = alpha.methods, 
+  variable.name = "Alpha.Metric", 
+  value.name = "Score"
+)
+cap <- paste0(
+  "Plot of scaled [0, 1] alpha-diversity scores by BaP treatment, extraction kit, and dissection method. Each boxplot represents ", nsamples(all.kits.ps) / 6, 
+  " independent samples (", nsamples(all.kits.ps), " total)."
+)
+alpha.EKandDM.plot <- ggplot(
+  alpha.equalized.dt, 
+  aes(x = Extraction.Kit, y = Score)
+) +
+  geom_boxplot(aes(fill = Dissect.Whole, color = BaP.Treat)) + 
+  facet_grid(Alpha.Metric ~ Dissect.Whole, scales = "free_y") +
+  scale_fill_manual(name = "Dissection Method", values = dissect.colors) +
+  scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+  labs(x = "Extraction Kit", y = "Alpha-diversity Metric Score")
+
+alpha.EKandDM.plot +
+  labs(caption = cap, caption.width = 40)
+
+ggsave(
+  alpha.EKandDM.plot, 
+  filename = file.path(dirs$plots, paste0("alpha_by_EKandDM_plot", fig.ext)),
+  width = fig.wd,
+  height = fig.ht * 1.2,
+  dpi = fig.dpi
+)
+```
+
+```{r alpha-EKandDM-plot2, fig.height=8, fig.width=4}
+alpha.equalized.dt <- melt(
+  full.subsmpl.smpl.dt,
+  measure.vars = alpha.methods, 
+  variable.name = "Alpha.Metric", 
+  value.name = "Score"
+)
+cap <- paste0(
+  "Plot of scaled [0, 1] alpha-diversity scores by BaP treatment, extraction kit, and dissection method. Each boxplot represents ", nsamples(all.kits.ps) / 6, 
+  " independent samples (", nsamples(all.kits.ps), " total)."
+)
+alpha.EKandDM.plot <- ggplot(
+  alpha.equalized.dt, 
+  aes(x = Extraction.Kit, y = Score)
+) +
+  geom_boxplot(aes(fill = Dissect.Whole, color = BaP.Treat)) + 
+  facet_grid(Alpha.Metric ~ Dissect.Whole, scales = "free_y") +
+  scale_fill_manual(name = "Dissection Method", values = dissect.colors) +
+  scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+  labs(x = "Extraction Kit", y = "Alpha-diversity Metric Score")
+
+alpha.EKandDM.plot +
+  labs(caption = cap, caption.width = 40)
+
+ggsave(
+  alpha.EKandDM.plot, 
+  filename = file.path(dirs$plots, paste0("alpha_by_EKandDM_plot_ALT", fig.ext)),
+  width = fig.wd,
+  height = fig.ht * 1.2,
+  dpi = fig.dpi
+)
+```
+
+```{r alpha-EKandDM-mainFig, include=FALSE}
+plot.file <- file.path(
+  dirs$main.figs,
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1, 
+    "_alpha_by_EKandDM_boxplot",
+    fig.ext
+  )
+)
+{
+  ggplot(
+    alpha.equalized.dt[Alpha.Metric %in% c("Chao1", "Phylogenetic")], 
+    aes(x = Extraction.Kit, y = Score)
+  ) +
+    geom_boxplot(aes(color = BaP.Treat)) + 
+    facet_grid(Alpha.Metric ~ Dissect.Whole, scales = "free_y") +
+    scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+    labs(x = "Extraction Kit", y = "Alpha-diversity Metric Score")
+} %>%
+  ggsave(
+    filename = plot.file,
+    width = fig.wd,
+    height = fig.ht,
+    dpi = fig.dpi
+  )
+
+plot.file <- file.path(
+  dirs$main.figs,
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1,
+    "_alpha_by_EKandDM_swarmplot", 
+    fig.ext
+  )
+)
+{
+  ggplot(
+    alpha.equalized.dt[Alpha.Metric %in% c("Chao1", "Phylogenetic")], 
+    aes(x = Extraction.Kit, y = Score)
+  ) +
+    geom_quasirandom(
+      aes(shape = Dissect.Whole, color = BaP.Treat), 
+      dodge.width = 1
+    ) + 
+    stat_summary(
+      aes(group = BaP.Treat), 
+      position = position_dodge(width = 1),
+      fun.data = "mean_cl_boot", 
+      geom = "errorbar"
+    ) +
+    facet_grid(Alpha.Metric ~ Dissect.Whole, scales = "free_y") +
+    scale_shape_manual(
+      name = "Dissection Method", 
+      values = c(17, 19), 
+      guide = "none"
+    ) +
+    scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+    labs(x = "Extraction Kit", y = "Alpha-diversity Metric Score") + 
+    theme(legend.box = "horizontal")
+} %>%
+  ggsave(
+    filename = plot.file,
+    width = fig.wd,
+    height = fig.ht,
+    dpi = fig.dpi
+  )
+
+tracking.env$fig.count <- tracking.env$fig.count + 1
+```
+
+## Beta-diversity results
+
+```{r pcr-dbRDA-stats}
+pcr.dbrda.list.file <- file.path(dirs$save, "list_pcr_dbRDAs.rds")
+pcr.dbrda.list <- redo.if("dbrdas", pcr.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- dist.list[[beta]]
+    capscale(
+      dist.mat ~ BaP.Treat * Single.Triplicate,
+      data = sample.df,
+      comm = otu.matrix(ps)
+    )
+  }
+  
+  stopCluster(cl)
+  res
+})
+
+pcr.dbrda.anovas.file <- file.path(dirs$save, "list_pcr_dbRDA_permanovas.rds")
+pcr.dbrda.anovas <- redo.if("dbrdas", pcr.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- pcr.dbrda.list[[beta]]
+    anova(
+      mod, 
+      by = "term", 
+      permutations = how(
+        nperm = 999, 
+        # within = Within(type = "series", mirror = TRUE),
+        blocks = sample.df$OriginID
+      )
+    )
+  }
+  stopCluster(cl)
+  res
+})
+```
+
+```{r pcr-CLR-dbRDA-stats}
+pcr.clr.dbrda.file <- file.path(dirs$save, "dbRDA_pcr_clr.rds")
+pcr.clr.dbrda <- redo.if("clr", pcr.clr.dbrda.file, {
+  capscale(
+    clr.dist ~ BaP.Treat * Single.Triplicate,
+    data = sample.data.frame(ps.clr),
+    comm = otu.matrix(ps.clr)
+  )
+})
+
+pcr.clr.dbrda.anova.file <- file.path(dirs$save, "permanova_pcr_clr_dbRDA.rds")
+pcr.clr.dbrda.anova <- redo.if("clr", pcr.clr.dbrda.anova.file, {
+  anova(
+    pcr.clr.dbrda, 
+    by = "term", 
+    permutations = how(
+      nperm = 999, 
+      # within = Within(type = "series", mirror = TRUE),
+      blocks = sample.data.frame(ps.clr)$OriginID
+    )
+  )
+})
+```
+
+```{r pcr-dbRDA-anova-print}
+table.file <- file.path(
+  dirs$supp.figs, 
+  paste0("suppTbl_", tracking.env$supp.tbl.count + 1,"_beta_by_pcr_stats.html")
+)
+anovas.list <- pcr.dbrda.anovas
+anovas.list[["Aitchison"]] <- pcr.clr.dbrda.anova
+lapply(beta.methods.all, function(beta) {
+  return(
+    anovas.list[[beta]] %>%
+      tidy() %>% 
+      rename_with(~ gsub("SumOfSqs|Variance", "SumOfSqs/Variance", .x)) %>%
+      mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+      mutate(metric = beta, .before = 1)
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    term = stri_replace_all_fixed(
+      term,
+      pattern = c("BaP.Treat", "Single.Triplicate"), 
+      replacement = c("BaP Treatment", "PCR Method"),
+      vectorize_all = FALSE
+    )
+  ) %>% 
+  flextable() %>%
+  set_caption(
+    caption = supp.tbl.caption(
+      paste0(
+        "PCR methods PERMANOVA results (n = ", length(unique(sample.df$OriginID)), ")" 
+      )
+    )
+  ) %>%
+  align(j = c(1, 7), align = "left") %>%
+  align(j = 2:6, align = "right") %>%
+  colformat_double(j = 4:5, digits = 2) %>%
+  colformat_double(j = 6, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+Unlike with alpha-diversity, the beta-diversity analyses do reveal as statistically significant main effect of single vs triplicate PCR on assessing microbiome composition. However, except for the Sørensen metric (a taxonomic presence/absence metric), there are no significant interactions between B*a*P treatment and PCR method predicting microbiome composition (Table 3). PCoA ordinations of beta-diversity reveal very similar centroids for B*a*P treatments, regardless of PCR method (Figure 3A).
+
+```{r EKandDM-dbRDA-stats}
+all.kits.dt <- sample.data.table(all.kits.ps) %>% setkeyv("Sample")
+all.kits.df <- sample.data.frame(all.kits.ps)
+
+full.dbrda.list.file <- file.path(dirs$save, "list_full_dbRDAs.rds")
+full.dbrda.list <- redo.if("dbrdas", full.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    dist.mat <- dist.list[[beta]] %>%
+      dist_subset(idx = sample_names(all.kits.ps))
+    capscale(
+      dist.mat ~ BaP.Treat * (Extraction.Kit + Dissect.Whole),
+      data = all.kits.df,
+      comm = otu.matrix(all.kits.ps)
+    )
+  }
+  
+  stopCluster(cl)
+  res
+})
+
+full.dbrda.anovas.file <- file.path(dirs$save, "list_full_dbRDA_permanovas.rds")
+full.dbrda.anovas <- redo.if("dbrdas", full.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- full.dbrda.list[[beta]]
+    anova(mod, by = "term")
+  }
+  
+  stopCluster(cl)
+  res
+})
+
+select.dbrda.list.file <- file.path(dirs$save, "list_select_dbRDAs.rds")
+select.dbrda.list <- redo.if("dbrdas", select.dbrda.list.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    full.mod <- full.dbrda.list[[beta]]
+    select.mod <- ordistep(full.mod, direction = "both")
+    return(select.mod)
+  }
+  
+  stopCluster(cl)
+  res
+})
+
+select.dbrda.anovas.file <- file.path(
+  dirs$save, 
+  "list_select_dbRDA_permanovas.rds"
+)
+select.dbrda.anovas <- redo.if("dbrdas", select.dbrda.anovas.file, {
+  cl <- makeCluster(num.cores, type = "FORK", outfile = "")
+  registerDoParallel(cl, num.cores)
+  res <- foreach(
+    beta = beta.methods,
+    .final = beta.setNames,
+    .verbose = TRUE
+  ) %dopar% {
+    mod <- select.dbrda.list[[beta]]
+    anova(mod, by = "term")
+  }
+  
+  stopCluster(cl)
+  res
+})
+```
+
+```{r EKandDM-CLR-dbRDA-stats}
+all.kits.clr.dt <- sample.data.table(all.kits.clr.ps) %>% setkeyv("Sample")
+all.kits.clr.df <- sample.data.frame(all.kits.clr.ps)
+
+full.dbrda.clr.file <- file.path(dirs$save, "dbRDA_clr_full.rds")
+full.dbrda.clr <- redo.if("clr", full.dbrda.clr.file, {
+  dist.mat <- dist.list[["Aitchison"]] %>%
+    dist_subset(idx = sample_names(all.kits.clr.ps))
+  capscale(
+    dist.mat ~ BaP.Treat * (Extraction.Kit + Dissect.Whole),
+    data = all.kits.clr.df,
+    comm = otu.matrix(all.kits.clr.ps)
+  )
+})
+
+full.dbrda.clr.anova.file <- file.path(dirs$save, "permanova_clr_full.rds")
+full.dbrda.clr.anova <- redo.if("clr", full.dbrda.clr.anova.file, {
+  anova(full.dbrda.clr, by = "term")
+})
+
+select.dbrda.clr.file <- file.path(dirs$save, "dbRDA_clr_select.rds")
+select.dbrda.clr <- redo.if("clr", select.dbrda.clr.file, {
+  ordistep(full.dbrda.clr, direction = "both")
+})
+
+select.dbrda.clr.anova.file <- file.path(dirs$save, "permanova_clr_select.rds")
+select.dbrda.clr.anova <- redo.if("clr", select.dbrda.clr.anova.file, {
+  anova(select.dbrda.clr, by = "term")
+})
+```
+
+```{r EKandDM-dbRDA-anova-print}
+table.file <- file.path(
+  dirs$supp.figs, 
+  paste0(
+    "suppTbl_", tracking.env$supp.tbl.count + 1,"_beta_by_EKandDM_stats.html"
+  )
+)
+anovas.list <- full.dbrda.anovas
+anovas.list[["Aitchison"]] <- full.dbrda.clr.anova
+lapply(beta.methods.all, function(beta) {
+  return(
+    anovas.list[[beta]] %>%
+      tidy() %>% 
+      rename_with(~ gsub("SumOfSqs|Variance", "SumOfSqs/Variance", .x)) %>%
+      mutate(sig = ifelse(p.value <= 0.05, "*", "")) %>%
+      mutate(metric = beta, .before = 1)
+  )
+}) %>%
+  bind_rows() %>%
+  mutate(
+    term = stri_replace_all_fixed(
+      term,
+      pattern = c("BaP.Treat", "Extraction.Kit", "Dissect.Whole"), 
+      replacement = c("BaP Treatment", "Extraction Kit", "Dissection Method"),
+      vectorize_all = FALSE
+    )
+  ) %>% 
+  flextable() %>%
+  set_caption(
+    caption = supp.tbl.caption(
+      paste0(
+        "Extraction kit and dissection methods PERMANOVA results (n = ", 
+        nsamples(all.kits.ps), ")"
+      )
+    )
+  ) %>%
+  align(j = c(1, 7), align = "left") %>%
+  align(j = 2:6, align = "right") %>%
+  colformat_double(j = 4:5, digits = 2) %>%
+  colformat_double(j = 6, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+```{r dbrda-ord-gen}
+dbrda <- full.dbrda.list[[1]]
+dbrda.data.list <- lapply(full.dbrda.list, function(dbrda) {
+  get.biplot.data(ps = all.kits.ps, ord = dbrda)
+})
+sample.coord.dt <- lapply(names(dbrda.data.list), function(beta) {
+  dbrda.data.list[[beta]]$sample.coords[, Dist := beta]
+  return(dbrda.data.list[[beta]]$sample.coords)
+}) %>% rbindlist()
+sample.coord.dt[
+  , Dist := factor(Dist, levels = names(beta.methods)[c(1, 4, 2, 5, 3, 6)])
+]
+axis.labels <- lapply(names(dbrda.data.list), function(beta) {
+  data.table(
+    Dist = beta,
+    X.lab = dbrda.data.list[[beta]]$axes.labs[1],
+    Y.lab = dbrda.data.list[[beta]]$axes.labs[2]
+  )
+})  %>% rbindlist()
+```
+
+```{r ords-PCRandEKandDM, fig.width=7.5, fig.height=9}
+beta1 <- "0.5 Unifrac"
+beta2 <- "U Unifrac"
+point.size <- 2
+centroid.size <- 3.5
+
+cap <- paste(
+  "dbRDA ordinations of beta-diversity distances between samples. Points represent individual samples in ordination space. Panels A-C are identical ordinations of", beta1, "distances, with different informatino overlaid: (A) Ellipses demarcate 95% C.I.s for centroids of each BaP treatment by PCR method grouping. (B) Ellipses demarcate 95% C.I.s for centroids of each BaP treatment by extraction kit grouping. (C) Ellipses demarcate 95% C.I.s for centroids of each BaP treatment by dissection method grouping. (D) Ordination of", beta2, "distances; ellipses demarcate 95% C.I.s for centroids of each BaP treatment by dissection method grouping."
+)
+centr.shapes <- c(0, 2, 5)
+panels <- NULL
+# set.tracking.nums("figure", 2)
+bap.by.pcr.centroids <- sample.coord.dt[
+  Dist == beta1, 
+  .(CAP1 = mean(CAP1), CAP2 = mean(CAP2)),
+  by = c("BaP.Treat", "Single.Triplicate", "Dist")
+]
+panels[[1]] <- ggplot(sample.coord.dt[Dist == beta1], aes(x = CAP1, y = CAP2)) + 
+  geom_point(aes(color = BaP.Treat), size = point.size) + 
+  geom_point(
+    aes(color = BaP.Treat, shape = Single.Triplicate),
+    data = bap.by.pcr.centroids, 
+    size = centroid.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Single.Triplicate)) + 
+  scale_color_manual(name = "BaP Treatment", values = bap.colors) +
+  scale_shape_manual(name = "PCR Methods", values = centr.shapes[1:2]) + 
+  scale_linetype_discrete(name = "PCR Methods") + 
+  labs(
+    x = axis.labels[Dist == beta1]$X.lab, 
+    y = axis.labels[Dist == beta1]$Y.lab,
+    subtitle = "half-weighted UniFrac"
+  ) 
+
+bap.by.kit.centroids <- sample.coord.dt[
+  Dist == beta1, 
+  .(CAP1 = mean(CAP1), CAP2 = mean(CAP2)),
+  by = c("BaP.Treat", "Extraction.Kit", "Dist")
+]
+panels[[2]] <- ggplot(sample.coord.dt[Dist == beta1], aes(x = CAP1, y = CAP2)) + 
+  geom_point(aes(color = BaP.Treat), size = point.size) + 
+  geom_point(
+    aes(color = BaP.Treat, shape = Extraction.Kit),
+    data = bap.by.kit.centroids, 
+    size = centroid.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Extraction.Kit)) + 
+  scale_color_manual(values = bap.colors, guide = "none") +
+  scale_shape_manual(name = "Extraction Kit", values = centr.shapes) + 
+  scale_linetype_manual(name = "Extraction Kit", values = 1:3) +
+  labs(
+    x = axis.labels[Dist == beta1]$X.lab, 
+    y = axis.labels[Dist == beta1]$Y.lab,
+    subtitle = "half-weighted UniFrac"
+  )
+
+bap.by.dissect.centroids <- sample.coord.dt[
+  Dist == beta1, 
+  .(CAP1 = mean(CAP1), CAP2 = mean(CAP2)),
+  by = c("BaP.Treat", "Dissect.Whole", "Dist")
+]
+panels[[3]] <- ggplot(sample.coord.dt[Dist == beta1], aes(x = CAP1, y = CAP2)) + 
+  geom_point(aes(color = BaP.Treat), size = point.size) + 
+  geom_point(
+    aes(color = BaP.Treat, shape = Dissect.Whole),
+    data = bap.by.dissect.centroids, 
+    size = centroid.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Dissect.Whole)) +  
+  scale_color_manual(values = bap.colors, guide = "none") +
+  scale_shape_manual(name = "Dissection Method", values = centr.shapes[1:2]) + 
+  scale_linetype_discrete(name = "Dissection Method") + 
+  labs(
+    x = axis.labels[Dist == beta1]$X.lab, 
+    y = axis.labels[Dist == beta1]$Y.lab,
+    subtitle = "half-weighted UniFrac"
+  ) # +
+# labs(caption = cap, caption.width = 100)
+
+bap.by.dissect.centroids <- sample.coord.dt[
+  Dist == beta2, 
+  .(CAP1 = mean(CAP1), CAP2 = mean(CAP2)),
+  by = c("BaP.Treat", "Dissect.Whole", "Dist")
+]
+panels[[4]] <- ggplot(sample.coord.dt[Dist == beta2], aes(x = CAP1, y = CAP2)) + 
+  geom_point(aes(color = BaP.Treat), size = point.size) + 
+  geom_point(
+    aes(color = BaP.Treat, shape = Dissect.Whole),
+    data = bap.by.dissect.centroids, 
+    size = centroid.size
+  ) +
+  stat_ellipse(aes(color = BaP.Treat, linetype = Dissect.Whole)) +  
+  scale_color_manual(values = bap.colors, guide = "none") +
+  scale_shape_manual(name = "Dissection Method", values = centr.shapes[1:2]) + 
+  scale_linetype_discrete(name = "Dissection Method") + 
+  labs(
+    x = axis.labels[Dist == beta2]$X.lab, 
+    y = axis.labels[Dist == beta2]$Y.lab,
+    subtitle = "unweighted UniFrac"
+  ) 
+plot.file <- file.path(
+  dirs$main.figs, 
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1,
+    "_beta_by_PCRandEKandDM_plot", 
+    fig.ext
+  )
+)
+plot_grid(plotlist = panels, nrow = 2, labels = "auto", align = "h") %>%
+  ggsave(
+    filename = plot.file,
+    width = fig.wd * 1.5,
+    height = fig.ht * 1.5,
+    dpi = fig.dpi
+  )
+tracking.env$fig.count <- tracking.env$fig.count + 1
+```
+
+For all six beta-diversity metrics assessed, there are significant main effects of B*a*P treatment, extraction kit, and disseciton method. There are, however, no statistically significant interactions between B*a*P treatment and either extraction kit or dissection method for four of the six beta-diversity metrics. Only for Canberrra and unweighted UniFrac is there a significant interaction between B*a*P treatement and dissection method (Table 4). These results imply that, while extraction kit and dissection method do have an effect on our measurements of microbiome composition, whether they influence our interpretation of how B*a*P treatment affects the composition of the gut microbiome in zebrafish depends on which beta-diversity metric is used. (Figures 3B-D). 
+
+In addition to overall microbiome diversity and composition, we wanted to get a sense of how different methods might impact which taxa were found to have significant associations with B*a*P treatment. 
+
+## LEfSe
+
+```{r gen-lefse-files, eval=FALSE}
+analysis.sets <- list(
+  list(
+    PS = all.kits.ps, 
+    Covars = c("BaP.Treat", "Extraction.Kit"), 
+    Filename = file.path(dirs$lefse, "bap_and_kit.txt")
+  ),
+  list(
+    PS = bt.only.ps, 
+    Covars = c("BaP.Treat"), 
+    Filename = file.path(dirs$lefse, "bap_BloodAndTissueOnly.txt")
+  ),
+  list(
+    PS = ns.only.ps, 
+    Covars = c("BaP.Treat"), 
+    Filename = file.path(dirs$lefse, "bap_NucleoSpinOnly.txt")
+  ),
+  list(
+    PS = ps.only.ps, 
+    Covars = c("BaP.Treat"), 
+    Filename = file.path(dirs$lefse, "bap_PowerSoilOnly.txt")
+  ),
+  list(
+    PS = all.dms.ps, 
+    Covars = c("BaP.Treat", "Dissect.Whole"), 
+    Filename = file.path(dirs$lefse, "bap_and_dissect.txt")
+  ),
+  list(
+    PS = dissect.only.ps, 
+    Covars = c("BaP.Treat"), 
+    Filename = file.path(dirs$lefse, "bap_dissectedOnly.txt")
+  ),
+  list(
+    PS = whole.only.ps, 
+    Covars = c("BaP.Treat"), 
+    Filename = file.path(dirs$lefse, "bap_wholeFishOnly.txt")
+  )
+)
+cl <- makeCluster(length(anaylsis.sets), type = "FORK", outfile = "")
+registerDoParallel(cl, length(anaylsis.sets))
+foreach(i = 1:length(analysis.sets), .verbose = TRUE) %dopar% {
+  set <- analysis.sets[[i]]
+  phyloseq2lefse(
+    ps = set$PS,
+    covars = set$Covars,
+    file.name = set$Filename
+  )
+}
+stopCluster(cl)
+
+lapply(data.ids$DMs, function(dm) {
+  lapply(2:4, function(i) {
+    data.i <- analysis.sets[[i]]
+    ps.i <- sample.data.table(data.i$PS)[Dissect.Whole == dm]$Sample %>%
+      prune_samples(., data.i$PS) %>%
+      prune_taxa(taxa_sums(.) > 0, .)
+    phyloseq2lefse(
+      ps = ps.i,
+      covars = data.i$Covars,
+      file.name = str_replace(data.i$Filename, "Only", paste0("_", dm, "Only"))
+    )
+  })
+})
+
+lapply(data.ids$EKs, function(ek) {
+  lapply(6:7, function(i) {
+    data.i <- analysis.sets[[i]]
+    ps.i <- sample.data.table(data.i$PS)[Extraction.Kit == ek]$Sample %>%
+      prune_samples(., data.i$PS) %>%
+      prune_taxa(taxa_sums(.) > 0, .)
+    phyloseq2lefse(
+      ps = ps.i,
+      covars = data.i$Covars,
+      file.name = str_replace(data.i$Filename, "Only", paste0("_", ek, "Only"))
+    )
+  })
+})
+```
+
+```{r lefse-heatmaps-gen1}
+lefse.heatmap.file <- "heatmapPlot_lefse_results.rds"
+lefse.heatmap <- redo.if("lefse.heatmap", lefse.heatmap.file, {
+  bg.color <- "gray40"
+  dms.lefse.files <- c("bap_dissectedOnly_res.txt", "bap_wholeFishOnly_res.txt")
+  dms.lefse.dt <- lapply(dms.lefse.files, function(file) {
+    dt <- read.table(
+      file.path(dirs$lefse, file), 
+      header = F, 
+      sep = "\t"
+    ) %>%
+      as.data.table() %>%
+      set_names(c("Taxon", "Score1", "BaP.Treat", "Effect.Size", "Score2")) %>%
+      .[BaP.Treat %in% c("control", "BaP")]
+    dt[, Data.Set := str_remove(str_extract(file, "_[a-z]+"), "_")]
+    return(dt)
+  }) %>% rbindlist()
+  dms.lefse.dt[, Data.Set := gsub("whole", "whole fish", Data.Set)]
+  dms.lefse.dt[, Comp := "Dissection\nMethods"]
+  
+  kits.lefse.files <- c(
+    "bap_BloodAndTissueOnly_res.txt", 
+    "bap_NucleoSpinOnly_res.txt", 
+    "bap_PowerSoilOnly_res.txt"
+  )
+  kits.lefse.dt <- lapply(kits.lefse.files, function(file) {
+    dt <- read.table(
+      file.path(dirs$lefse, file), 
+      header = F, 
+      sep = "\t"
+    ) %>%
+      as.data.table() %>%
+      set_names(c("Taxon", "Score1", "BaP.Treat", "Effect.Size", "Score2")) %>%
+      .[BaP.Treat %in% c("control", "BaP")]
+    dt[, Data.Set := str_remove_all(str_extract(file, "_[A-Za-z]+"), "_|Only")]
+    return(dt)
+  }) %>% rbindlist()
+  kits.lefse.dt[, Data.Set := gsub("And", " & ", Data.Set)]
+  kits.lefse.dt[, Comp := "Extraction\nKits"]
+  all.lefse.dt <- rbind(dms.lefse.dt, kits.lefse.dt)
+  all.lefse.dt[
+    , Effect.Size := ifelse(
+      BaP.Treat == "control", 
+      Effect.Size * -1, 
+      Effect.Size
+    )
+  ]
+  all.lefse.dt[
+    , Taxon.Level := sapply(str_split(all.lefse.dt$Taxon, ""), function(split) {
+      str_subset(split, "\\.") %>% length()
+    }) 
+  ]
+  all.lefse.dt[
+    , Taxon := factor(
+      Taxon, 
+      levels = rev(unique(all.lefse.dt[order(Taxon.Level, Taxon)]$Taxon))
+    )
+  ]
+  cap <- "Heatmaps showing LDA effect sizes for taxa identified as indicators of either no BaP exposure (controls; green), or BaP exposure (orange) according to LEfSe analysi. The intensity of the colors indicates relative effect size (cuttoff |effect size| > 2)"
+  lefse.heatmap <- ggplot(
+    all.lefse.dt, 
+    aes(x = Data.Set, y = Taxon, fill = Effect.Size)
+  ) + 
+    geom_tile(color = bg.color) + 
+    scale_fill_gradientn(colors = c(bap.colors[1], "white", bap.colors[2])) +
+    scale_x_discrete(expand = c(0, 0.53)) +
+    theme(
+      panel.background = element_rect(fill = bg.color), 
+      axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+    ) + 
+    facet_wrap(~ Comp, scales = "free_x") +
+    theme(axis.title = element_blank()) + 
+    labs(caption = cap, supplemental = T)
+  ggsave(
+    lefse.heatmap, 
+    filename = file.path(dirs$plots, "lefse_results_heatmap.pdf"), 
+    width = 8, 
+    height = 40
+  )
+  
+  all.taxa <- sort(unique(as.character(all.lefse.dt$Taxon)))
+  consistent.taxa <- sapply(all.taxa, function(taxon) {
+    taxon.dt <- all.lefse.dt[Taxon == taxon]
+    multiple.set <- which(table(taxon.dt$Comp) > 1)
+    if (length(multiple.set) > 0) {
+      sapply(names(multiple.set), function(set) {
+        set.dt <- taxon.dt[Comp == set]
+        congruent.eff <- all(set.dt$Effect.Size < 0) | all(set.dt$Effect.Size > 0)
+        if (congruent.eff) { return(unname(taxon)) }
+      })
+    }
+  }) %>% unlist() %>% unname()
+  {
+    ggplot(
+      all.lefse.dt[Taxon %in% consistent.taxa], 
+      aes(x = Data.Set, y = Taxon, fill = Effect.Size)
+    ) + 
+      geom_tile(color = bg.color) + 
+      scale_fill_gradientn(colors = c(bap.colors[1], "white", bap.colors[2])) +
+      scale_x_discrete(expand = c(0, 0.53)) +
+      theme(
+        panel.background = element_rect(fill = bg.color), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+      ) + 
+      facet_wrap(~ Comp, scales = "free_x") +
+      theme(axis.title = element_blank())
+  } %>%
+    ggsave(
+      filename = file.path(dirs$plots, "lefse_results_consistentTaxa_heatmap.pdf"), 
+      width = 8, 
+      height = 12
+    )
+  lefse.heatmap
+})
+tracking.env$fig.count <- tracking.env$fig.count + 1
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+```{r lefse-heatmaps-gen2}
+lefse.heatmap.file <- "heatmapPlot_lefse_results_intrxns.rds"
+lefse.heatmap <- redo.if("lefse.heatmap", lefse.heatmap.file, {
+  bg.color <- "gray40"
+  lefse.files <- list.files(dirs$lefse, full.names = T) %>%
+    str_subset("res.txt") %>%
+    str_subset("Soil_|Spin_|Tissue_")
+  lefse.dt <- lapply(lefse.files, function(file) {
+    dt <- read.table(
+      file, 
+      header = F, 
+      sep = "\t"
+    ) %>%
+      as.data.table() %>%
+      set_names(c("Taxon", "Score1", "BaP.Treat", "Effect.Size", "Score2")) %>%
+      .[BaP.Treat %in% c("control", "BaP")]
+    dt[
+      , `:=`(
+        Dissect.Whole = str_extract(basename(file), "dissected|whole fish"),
+        Extraction.Kit = str_remove(str_extract(basename(file), "bap_[A-Za-z]+"), "bap_")
+      )
+    ]
+    return(dt)
+  }) %>% rbindlist()
+  
+  lefse.dt[
+    , Effect.Size := ifelse(
+      BaP.Treat == "control", 
+      Effect.Size * -1, 
+      Effect.Size
+    )
+  ]
+  lefse.dt[
+    , Taxon.Level := sapply(str_split(lefse.dt$Taxon, ""), function(split) {
+      str_subset(split, "\\.") %>% length()
+    }) 
+  ]
+  lefse.dt[
+    , Taxon := factor(
+      Taxon, 
+      levels = rev(unique(lefse.dt[order(Taxon.Level, Taxon)]$Taxon))
+    )
+  ]
+  cap <- "Heatmaps showing LDA effect sizes for taxa identified as indicators of either no BaP exposure (controls; green), or BaP exposure (orange) according to LEfSe analysis. The intensity of the colors indicates relative effect size (cuttoff |effect size| > 2)"
+  lefse.heatmap <- ggplot(
+    lefse.dt, 
+    aes(x = Dissect.Whole, y = Taxon, fill = Effect.Size)
+  ) + 
+    geom_tile(color = bg.color) + 
+    scale_fill_gradientn(
+      name = "Effect size", 
+      colors = c(bap.colors[1], "white", bap.colors[2])
+    ) +
+    scale_x_discrete(expand = c(0, 0.53)) +
+    theme(
+      panel.background = element_rect(fill = bg.color),
+      axis.title = element_blank()
+    ) + 
+    facet_wrap( ~ Extraction.Kit)
+  ggsave(
+    lefse.heatmap, 
+    filename = file.path(dirs$plots, "lefse_results_heatmap2.pdf"), 
+    width = 10, 
+    height = 26
+  )
+  
+  all.taxa <- sort(unique(as.character(all.lefse.dt$Taxon)))
+  consistent.taxa <- sapply(all.taxa, function(taxon) {
+    taxon.dt <- all.lefse.dt[Taxon == taxon]
+    multiple.set <- which(table(taxon.dt$Comp) > 1)
+    if (length(multiple.set) > 0) {
+      sapply(names(multiple.set), function(set) {
+        set.dt <- taxon.dt[Comp == set]
+        congruent.eff <- all(set.dt$Effect.Size < 0) | all(set.dt$Effect.Size > 0)
+        if (congruent.eff) { return(unname(taxon)) }
+      })
+    }
+  }) %>% unlist() %>% unname()
+  {
+    ggplot(
+      all.lefse.dt[Taxon %in% consistent.taxa], 
+      aes(x = Data.Set, y = Taxon, fill = Effect.Size)
+    ) + 
+      geom_tile(color = bg.color) + 
+      scale_fill_gradientn(colors = c(bap.colors[1], "white", bap.colors[2])) +
+      scale_x_discrete(expand = c(0, 0.53)) +
+      theme(
+        panel.background = element_rect(fill = bg.color), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+      ) + 
+      facet_wrap(~ Comp, scales = "free_x") +
+      theme(axis.title = element_blank())
+  } %>%
+    ggsave(
+      filename = file.path(dirs$plots, "lefse_results_consistentTaxa_heatmap.pdf"), 
+      width = 8, 
+      height = 12
+    )
+  lefse.heatmap
+})
+tracking.env$fig.count <- tracking.env$fig.count + 1
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+
+We used LEfSe, a hierarchical linear discriminate analysis to determine which taxa (at various taxonomic levels) are significant indicators of B*a*P exposure using different data sets (dissected vs whole fish & each extraction kit). We identified a few taxa that are consistently indicative of no exposure (Gammaproteobacteria, Paracaedibacteraceae) and of B*a*P exposure (Bacteroida, Clostridia, Chlamydiae). There were, however, most taxa identified as an indicator in one data set were not identified as so consistently across the others (Supplemental Figure 1).
+
+## Random Forests: Dissected vs Whole 
+
+```{r random-forest-dms-comparisons}
+source(file.path(dirs$scripts, "random_forest_functions.R"))
+source(file.path(dirs$scripts, "parallel_altmann_impt_features.R"))
+
+whole.only.rf.file <- file.path(dirs$save, "rf_wholeFishOnly_predictBaP.rds")
+whole.only.rf <- redo.if("subsampling", whole.only.rf.file, {
+  gen.bap.random.forest(whole.only.ps, user.seed) 
+})
+
+whole.only.impt.dt.file <- file.path(dirs$save, "dt_wholeFishOnly_rfImportance.rds")
+whole.only.impt.dt <- redo.if("subsampling", whole.only.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = whole.only.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+whole.only.impt.dt[, Covar := NULL]
+sig.whole.only.impt.dt <- whole.only.impt.dt[Pvalue <= 0.05]
+
+dissect.only.rf.file <- file.path(dirs$save, "rf_dissectedOnly_predictBaP.rds")
+dissect.only.rf <- redo.if("subsampling", dissect.only.rf.file, {
+  gen.bap.random.forest(dissect.only.ps, user.seed)
+})
+
+dissect.only.impt.dt.file <- file.path(dirs$save, "dt_dissectedOnly_rfImportance.rds")
+dissect.only.impt.dt <- redo.if("subsampling", dissect.only.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = dissect.only.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+dissect.only.impt.dt[, Covar := NULL]
+sig.dissect.only.impt.dt <- dissect.only.impt.dt[Pvalue <= 0.05]
+names(sig.whole.only.impt.dt)[2:3] <- paste0("Whole.", names(sig.whole.only.impt.dt)[2:3])
+names(sig.dissect.only.impt.dt)[2:3] <- paste0(
+  "Dissect.", names(sig.dissect.only.impt.dt)[2:3]
+)
+
+dms.sig.impt.dt <- merge(
+  sig.whole.only.impt.dt, 
+  sig.dissect.only.impt.dt, 
+  by = "ASV", 
+  all = T
+) %>% 
+  setcolorder(neworder = c(1, 2, 4, 3, 5)) %>% 
+  setkeyv("ASV")
+taxa.tbl <- taxa.data.table(ps, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+dms.sig.impt.taxa.dt <- dms.sig.impt.dt[taxa.tbl, nomatch = 0]
+
+dms.sig.impt.taxa.dt[
+  , Mean.Impt := purrr::pmap(
+    .(Whole.Importance, Dissect.Importance), 
+    my.mean
+  ) %>% unlist()
+]
+```
+
+```{r random-forest-dms-roc-plot, fig.height=5, fig.width=4}
+roc.whole <- roc(whole.only.rf$pred$obs, whole.only.rf$pred$control)
+roc.dissect <- roc(dissect.only.rf$pred$obs, dissect.only.rf$pred$control)
+roc.dt <- data.table(
+  Specificity = c(roc.whole$specificities, roc.dissect$specificities),
+  Sensitivity = c(roc.whole$sensitivities, roc.dissect$sensitivities),
+  Dissection.Status = c(
+    rep("Whole Fish", length(roc.whole$specificities)), 
+    rep("Dissected", length(roc.dissect$specificities))
+  )
+)
+
+cap <- paste(
+  "Performance of models to predict BaP vs control treatments using either just samples from whole fish or dissected guts. The AUC for the dissected guts model is", round(roc.dissect$auc, 3), "and for the whole fish model is", round(roc.whole$auc, 3)
+)
+dms.rar.roc.plot <- ggplot(
+  roc.dt, 
+  aes(x = Specificity, y = Sensitivity, color = Dissection.Status)
+) + 
+  geom_line() +
+  scale_color_manual(name = "Dissection Status", values = dissect.colors) +
+  scale_x_reverse() + 
+  coord_equal()
+dms.rar.roc.plot +
+  labs(caption = cap, caption.width = 40)
+
+dms.rar.aucs.tbl <- data.table(
+  `Dissection Method` = c("Dissected", "Whole Fish"),
+  AUC = round(c(roc.dissect$auc, roc.whole$auc), 3)
+) %>%
+  tableGrob(rows = NULL)
+```
+
+### CLR 
+
+```{r random-forest-dms-clr-comparisons}
+source(file.path(dirs$scripts, "random_forest_functions.R"))
+source(file.path(dirs$scripts, "parallel_altmann_impt_features.R"))
+
+whole.only.clr.rf.file <- file.path(dirs$save, "rf_wholeFishOnly_clr_predictBaP.rds")
+whole.only.clr.rf <- redo.if("clr", whole.only.clr.rf.file, {
+  gen.bap.random.forest(whole.only.clr.ps, user.seed) 
+})
+
+whole.only.clr.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_wholeFishOnly_clr_rfImportance.rds"
+)
+whole.only.clr.impt.dt <- redo.if("clr", whole.only.clr.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = whole.only.clr.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+whole.only.clr.impt.dt[, Covar := NULL]
+sig.whole.only.clr.impt.dt <- whole.only.clr.impt.dt[Pvalue <= 0.05]
+
+dissect.only.clr.rf.file <- file.path(
+  dirs$save, 
+  "rf_dissectedOnly_clr_predictBaP.rds"
+)
+dissect.only.clr.rf <- redo.if("clr", dissect.only.clr.rf.file, {
+  gen.bap.random.forest(dissect.only.clr.ps, user.seed)
+})
+
+dissect.only.clr.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_dissectedOnly_clr_rfImportance.rds"
+)
+dissect.only.clr.impt.dt <- redo.if("clr", dissect.only.clr.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = dissect.only.clr.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+dissect.only.clr.impt.dt[, Covar := NULL]
+sig.dissect.only.clr.impt.dt <- dissect.only.clr.impt.dt[Pvalue <= 0.05]
+names(sig.whole.only.clr.impt.dt)[2:3] <- paste0(
+  "Whole.", names(sig.whole.only.clr.impt.dt)[2:3]
+)
+names(sig.dissect.only.clr.impt.dt)[2:3] <- paste0(
+  "Dissect.", names(sig.dissect.only.clr.impt.dt)[2:3]
+)
+
+dms.sig.impt.clr.dt <- merge(
+  sig.whole.only.clr.impt.dt, 
+  sig.dissect.only.clr.impt.dt, 
+  by = "ASV", 
+  all = T
+) %>% 
+  setcolorder(neworder = c(1, 2, 4, 3, 5)) %>% 
+  setkeyv("ASV")
+taxa.tbl <- taxa.data.table(ps.clr, taxon.column.name = "ASV")
+# taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+dms.sig.impt.taxa.clr.dt <- dms.sig.impt.clr.dt[taxa.tbl, nomatch = 0]
+dms.sig.impt.taxa.clr.dt[
+  , Mean.Impt := pmap(
+    .(Dissect.Importance, Whole.Importance), 
+    my.mean
+  ) %>% unlist()
+]
+```
+
+```{r random-forest-dms-clr-roc-plot, fig.height=5, fig.width=4}
+roc.clr.whole <- roc(whole.only.clr.rf$pred$obs, whole.only.clr.rf$pred$control)
+roc.clr.dissect <- roc(dissect.only.clr.rf$pred$obs, dissect.only.clr.rf$pred$control)
+roc.clr.dt <- data.table(
+  Specificity = c(roc.clr.whole$specificities, roc.clr.dissect$specificities),
+  Sensitivity = c(roc.clr.whole$sensitivities, roc.clr.dissect$sensitivities),
+  Dissection.Status = c(
+    rep("Whole Fish", length(roc.clr.whole$specificities)), 
+    rep("Dissected", length(roc.clr.dissect$specificities))
+  )
+)
+
+cap <- paste("Performance of models to predict BaP vs control treatments using either just samples from whole fish or dissected guts with CLR-transformed counts. The AUC for the dissected guts model is", round(roc.clr.dissect$auc, 3), "and for the whole fish model is", round(roc.clr.whole$auc, 3))
+dms.clr.roc.plot <- ggplot(
+  roc.clr.dt, 
+  aes(x = Specificity, y = Sensitivity, color = Dissection.Status)
+) + 
+  geom_line() +
+  scale_color_manual(name = "Dissection Status", values = dissect.colors) +
+  scale_x_reverse() + 
+  coord_equal()
+
+dms.clr.roc.plot +
+  labs(caption = cap, caption.width = 40)
+
+dms.clr.aucs.tbl <- data.table(
+  `Dissection Method` = c("Dissected", "Whole Fish"),
+  AUC = round(c(roc.clr.dissect$auc, roc.clr.whole$auc), 3)
+) %>%
+  tableGrob(rows = NULL)
+```
+
+## Random Forests: Extraction Kits
+
+```{r random-forest-kits-comparisons}
+source(file.path(dirs$scripts, "random_forest_functions.R"))
+source(file.path(dirs$scripts, "parallel_altmann_impt_features.R"))
+
+bt.only.rf.file <- file.path(dirs$save, "rf_bloodTissueOnly_predictBaP.rds")
+bt.only.rf <- redo.if("subsampling", bt.only.rf.file, {
+  gen.bap.random.forest(bt.only.ps, user.seed) 
+})
+bt.only.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_bloodTissueOnly_rfImportance.rds"
+)
+bt.only.impt.dt <- redo.if("subsampling", bt.only.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = bt.only.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+bt.only.impt.dt[, Covar := NULL]
+sig.bt.only.impt.dt <- bt.only.impt.dt[Pvalue <= 0.05]
+
+ns.only.rf.file <- file.path(dirs$save, "rf_nucleoSpinOnly_predictBaP.rds")
+ns.only.rf <- redo.if("subsampling", ns.only.rf.file, {
+  gen.bap.random.forest(ns.only.ps, user.seed) 
+})
+ns.only.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_nucleoSpinOnly_rfImportance.rds"
+)
+ns.only.impt.dt <- redo.if("subsampling", ns.only.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = ns.only.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+ns.only.impt.dt[, Covar := NULL]
+sig.ns.only.impt.dt <- ns.only.impt.dt[Pvalue <= 0.05]
+
+ps.only.rf.file <- file.path(dirs$save, "rf_powerSoilOnly_predictBaP.rds")
+ps.only.rf <- redo.if("subsampling", ps.only.rf.file, {
+  gen.bap.random.forest(ps.only.ps, user.seed) 
+})
+ps.only.impt.dt.file <- file.path(dirs$save, "dt_powerSoilOnly_rfImportance.rds")
+ps.only.impt.dt <- redo.if("subsampling", ps.only.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = ps.only.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+ps.only.impt.dt[, Covar := NULL]
+sig.ps.only.impt.dt <- ps.only.impt.dt[Pvalue <= 0.05]
+
+names(sig.bt.only.impt.dt)[2:3] <- paste0("BT.", names(sig.bt.only.impt.dt)[2:3])
+names(sig.ns.only.impt.dt)[2:3] <- paste0("NS.", names(sig.ns.only.impt.dt)[2:3])
+names(sig.ps.only.impt.dt)[2:3] <- paste0("PS.", names(sig.ps.only.impt.dt)[2:3])
+
+kits.sig.impt.dt <- merge(
+  sig.bt.only.impt.dt, 
+  sig.ns.only.impt.dt, 
+  by = "ASV", 
+  all = T
+) %>% 
+  merge(
+    sig.ps.only.impt.dt,
+    by = "ASV", 
+    all = T
+  ) %>% 
+  setcolorder(neworder = c(1, 2, 4, 6, 3, 5, 7)) %>% 
+  setkeyv("ASV")
+taxa.tbl <- taxa.data.table(ps, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+kits.sig.impt.taxa.dt <- kits.sig.impt.dt[taxa.tbl, nomatch = 0]
+kits.sig.impt.taxa.dt[
+  , Mean.Impt := pmap(
+    .(BT.Importance, NS.Importance, PS.Importance), 
+    my.mean
+  ) %>% unlist()
+]
+```
+
+```{r random-forest-kits-roc-plot, fig.height=5, fig.width=4}
+roc.bt <- roc(bt.only.rf$pred$obs, bt.only.rf$pred$control)
+roc.ns <- roc(ns.only.rf$pred$obs, ns.only.rf$pred$control)
+roc.ps <- roc(ps.only.rf$pred$obs, ps.only.rf$pred$control)
+roc.dt <- data.table(
+  Specificity = c(
+    sort(roc.bt$specificities), roc.ns$specificities, roc.ps$specificities
+  ),
+  Sensitivity = c(
+    sort(roc.bt$sensitivities, decreasing = T), roc.ns$sensitivities, roc.ps$sensitivities
+  ),
+  Extraction.Kit = c(
+    rep("Blood & Tissue", length(roc.bt$specificities)), 
+    rep("NucleoSpin", length(roc.ns$specificities)),
+    rep("PowerSoil", length(roc.ps$specificities))
+  )
+)
+
+cap <- paste0(
+  "Performance of models to predict BaP vs control treatments using only samples from each extraction kit. The AUC for the Blood & Tissue kit model is ", round(roc.bt$auc, 3), ", for the NucleoSpin kit model is ", round(roc.ns$auc, 3), ", and for the PowerSoil kit model is ", round(roc.ps$auc, 3)
+)
+kits.rar.roc.plot <- ggplot(
+  roc.dt, 
+  aes(x = Specificity, y = Sensitivity, linetype = Extraction.Kit)
+) + 
+  geom_line() +
+  scale_x_reverse() + 
+  coord_equal()
+
+kits.rar.roc.plot +
+  labs(caption = cap, caption.width = 40)
+
+kits.rar.aucs.tbl <- data.table(
+  `Extraction Kit` = c("Blood & Tissue", "NucleoSpin", "PowerSoil"),
+  AUC = round(c(roc.bt$auc, roc.ns$auc, roc.ps$auc), 3)
+) %>%
+  tableGrob(rows = NULL)
+```
+
+### CLR 
+
+```{r random-forest-kits-clr-comparisons}
+source(file.path(dirs$scripts, "random_forest_functions.R"))
+source(file.path(dirs$scripts, "parallel_altmann_impt_features.R"))
+
+bt.only.clr.rf.file <- file.path(
+  dirs$save, 
+  "rf_bloodTissueOnly_clr_predictBaP.rds"
+)
+bt.only.clr.rf <- redo.if("clr", bt.only.clr.rf.file, {
+  gen.bap.random.forest(bt.only.clr.ps, user.seed) 
+})
+bt.only.clr.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_bloodTissueOnly_clr_rfImportance.rds"
+)
+bt.only.clr.impt.dt <- redo.if("clr", bt.only.clr.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = bt.only.clr.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+bt.only.clr.impt.dt[, Covar := NULL]
+sig.bt.only.clr.impt.dt <- bt.only.clr.impt.dt[Pvalue <= 0.05]
+
+ns.only.clr.rf.file <- file.path(
+  dirs$save, 
+  "rf_nucleoSpinOnly_clr_predictBaP.rds"
+)
+ns.only.clr.rf <- redo.if("clr", ns.only.clr.rf.file, {
+  gen.bap.random.forest(ns.only.clr.ps, user.seed) 
+})
+ns.only.clr.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_nucleoSpinOnly_clr_rfImportance.rds"
+)
+ns.only.clr.impt.dt <- redo.if("clr", ns.only.clr.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = ns.only.clr.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+ns.only.clr.impt.dt[, Covar := NULL]
+sig.ns.only.clr.impt.dt <- ns.only.clr.impt.dt[Pvalue <= 0.05]
+
+ps.only.clr.rf.file <- file.path(
+  dirs$save, 
+  "rf_powerSoilOnly_clr_predictBaP.rds"
+)
+ps.only.clr.rf <- redo.if("clr", ps.only.clr.rf.file, {
+  gen.bap.random.forest(ps.only.clr.ps, user.seed) 
+})
+ps.only.clr.impt.dt.file <- file.path(
+  dirs$save, 
+  "dt_powerSoilOnly_clr_rfImportance.rds"
+)
+ps.only.clr.impt.dt <- redo.if("clr", ps.only.clr.impt.dt.file, {
+  parallel.altmann.impt.features(
+    randForest = ps.only.clr.rf, 
+    dependent.var = "BaP.Treat", 
+    num.cores = num.cores
+  )
+})
+ps.only.clr.impt.dt[, Covar := NULL]
+sig.ps.only.clr.impt.dt <- ps.only.clr.impt.dt[Pvalue <= 0.05]
+
+names(sig.bt.only.clr.impt.dt)[2:3] <- paste0("BT.", names(sig.bt.only.clr.impt.dt)[2:3])
+names(sig.ns.only.clr.impt.dt)[2:3] <- paste0("NS.", names(sig.ns.only.clr.impt.dt)[2:3])
+names(sig.ps.only.clr.impt.dt)[2:3] <- paste0("PS.", names(sig.ps.only.clr.impt.dt)[2:3])
+
+kits.sig.impt.clr.dt <- merge(
+  sig.bt.only.clr.impt.dt, 
+  sig.ns.only.clr.impt.dt, 
+  by = "ASV", 
+  all = T
+) %>% 
+  merge(
+    sig.ps.only.clr.impt.dt,
+    by = "ASV", 
+    all = T
+  ) %>% 
+  setcolorder(neworder = c(1, 2, 4, 6, 3, 5, 7)) %>% 
+  setkeyv("ASV")
+taxa.tbl <- taxa.data.table(ps.clr, taxon.column.name = "ASV")
+# taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+kits.sig.impt.taxa.clr.dt <- kits.sig.impt.clr.dt[taxa.tbl, nomatch = 0]
+kits.sig.impt.taxa.clr.dt[
+  , Mean.Impt := pmap(
+    .(BT.Importance, NS.Importance, PS.Importance), 
+    my.mean
+  ) %>% unlist()
+]
+```
+
+```{r random-forest-kits-clr-roc-plot, fig.height=5, fig.width=4}
+roc.clr.bt <- roc(bt.only.clr.rf$pred$obs, bt.only.clr.rf$pred$control)
+roc.clr.ns <- roc(ns.only.clr.rf$pred$obs, ns.only.clr.rf$pred$control)
+roc.clr.ps <- roc(ps.only.clr.rf$pred$obs, ps.only.clr.rf$pred$control)
+roc.clr.dt <- data.table(
+  Specificity = c(
+    sort(roc.clr.bt$specificities), roc.clr.ns$specificities, roc.clr.ps$specificities
+  ),
+  Sensitivity = c(
+    sort(roc.clr.bt$sensitivities, decreasing = T), roc.clr.ns$sensitivities, roc.clr.ps$sensitivities
+  ),
+  Extraction.Kit = c(
+    rep("Blood & Tissue", length(roc.clr.bt$specificities)), 
+    rep("NucleoSpin", length(roc.clr.ns$specificities)),
+    rep("PowerSoil", length(roc.clr.ps$specificities))
+  )
+)
+
+cap <- paste0(
+  "Performance of models to predict BaP vs control treatments using only samples from each extraction kit. The AUC for the Blood & Tissue kit model is ", round(roc.clr.bt$auc, 3), ", for the NucleoSpin kit model is ", round(roc.clr.ns$auc, 3), ", and for the PowerSoil kit model is ", round(roc.clr.ps$auc, 3)
+)
+kits.clr.roc.plot <- ggplot(
+  roc.clr.dt, 
+  aes(x = Specificity, y = Sensitivity, linetype = Extraction.Kit)
+) + 
+  geom_line() +
+  scale_x_reverse() + 
+  coord_equal()
+
+kits.clr.roc.plot +
+  labs(caption = cap, caption.width = 40)
+
+kits.clr.aucs.tbl <- data.table(
+  `Extraction Kit` = c("Blood & Tissue", "NucleoSpin", "PowerSoil"),
+  AUC = round(c(roc.clr.bt$auc, roc.clr.ns$auc, roc.clr.ps$auc), 3)
+) %>%
+  tableGrob(rows = NULL)
+```
+
+```{r rfs-roc-mainFig, include=FALSE}
+plot.file1 <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1, 
+    "_randomForest_ROCs_rarefiedCounts",
+    fig.ext
+  )
+)
+plot_grid(
+  plot_grid(dms.rar.roc.plot, kits.rar.roc.plot, labels = "auto"),
+  plot_grid(dms.rar.aucs.tbl, kits.rar.aucs.tbl),
+  ncol = 1,
+  rel_heights = c(10, 2)
+) %>%
+  ggsave(
+    filename = plot.file1,
+    width = fig.wd * 1.2,
+    height = fig.ht * 0.8,
+    dpi = fig.dpi
+  )
+
+plot.file2 <- file.path(
+  dirs$main.figs,
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1, 
+    "_randomForest_ROCs_clrCounts",
+    fig.ext
+  )
+)
+plot_grid(
+  plot_grid(dms.clr.roc.plot, kits.clr.roc.plot, labels = "auto"),
+  plot_grid(dms.clr.aucs.tbl, kits.clr.aucs.tbl),
+  ncol = 1,
+  rel_heights = c(10, 2)
+) %>%
+  ggsave(
+    filename = plot.file2,
+    width = fig.wd * 1.2,
+    height = fig.ht * 0.8,
+    dpi = fig.dpi
+  )
+tracking.env$fig.count <- tracking.env$fig.count + 1
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+The random forest models produced a number of taxa that were deemed significantly important, which we used in subsequent analyses. We also used the models to produce ROC curves to see which data sets were better at predicting B*a*P treatment from ASV abundances. Model performance is assessed at the area under the curve (AUC) under the ROC curve. The whole fish data set had a greater AUC, 0.869, than the dissected guts data set, 0.734 (Figure 4). For the extraction kits, the Blood & Tissue kit data set made the best predictions of B*a*P treatment, AUC 0.851, other kits < 0.78 (Figure 5).
+
+## Logit GLMs: Dissected vs Whole 
+
+```{r logit-glm-dmsSplit}
+dm.ids <- setNames(c("dissect", "whole"), c("dissected", "whole fish"))
+mod.dt.list <- lapply(setNames(dm.ids, dm.ids), function(dm) {
+  asvs.dt <- get(paste0(dm, ".only.ps")) %>%
+    otu.data.table() %>%
+    setkeyv(smpl.col.name)
+  smpl.dt <- get(paste0(dm, ".only.ps")) %>%
+    sample.data.table() %>%
+    setkeyv(smpl.col.name)
+  return(smpl.dt[asvs.dt])
+})
+set.seed(user.seed)
+glm.res.dt.file <- file.path(
+  dirs$save, 
+  "dt_subsampled_sigImpt_ASVs_logitGLM_results_splitDMs.rds"
+)
+glm.dmsSplit.res.dt <- redo.if("logitGLMs", glm.res.dt.file, {
+  lapply(dm.ids, function(dm) {
+    ASVs <- dms.sig.impt.taxa.dt[
+      order(Mean.Impt, decreasing = T, na.last = T)
+    ]$ASV
+    ASVs <- ASVs[ASVs %in% names(mod.dt.list[[dm]])]
+    idx <- 0
+    p.value <- 1
+    curr.glm <- NULL
+    while(p.value > 0.05 & idx < length(ASVs)) {
+      idx <- idx + 1
+      curr.glm <-  glm(
+        as.formula(paste("BaP.Treat ~", ASVs[idx])), 
+        family = "binomial",
+        data = mod.dt.list[[dm]]
+      )
+      p.value <- tidy(curr.glm)$p.value[2]
+    }
+    for (i in (idx + 1):length(ASVs)) {
+      cat(i, sep = "\n")
+      new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+      new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+      if (is.na(new.p)) {
+        next
+      } else {
+        if (new.p <= 0.05) {
+          curr.glm <- new.glm
+        } else {
+          next
+        }
+      }
+    }
+    res <- Anova(curr.glm, type = 2) %>%
+      tidy() %>%
+      mutate(data.set = names(which(dm.ids == dm)), .before = 1)  %>%
+      as.data.table() %>%
+      setkeyv("term")
+    return(res)
+  }) %>% rbindlist()
+})
+setkey(glm.dmsSplit.res.dt, term)
+glm.dmsSplit.res.dt[, sig := ifelse(p.value <= 0.05, "*", "")]
+table.file <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppTbl_", 
+    tracking.env$supp.tbl.count + 1, 
+    "_logisticGLMs_splitDMs_rarefiedCounts.html"
+  )
+)
+caption <- "Results of two binomial GLM models (one for each dissection method), built in a serial, forward stepwise manner predicting BaP treatment from individual ASV abundances."
+flextable(glm.dmsSplit.res.dt[order(data.set)]) %>%
+  set_caption(caption = supp.tbl.caption(caption)) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+In order to determine how dissection method influences our interpretation of how individual microbiome taxa associate with BaP exposure, we built binomial generalized linear models predicting BaP treatment from ASV abundances for both dissection-only samples, and whole fish samples (two total models; Table 5). ASVs retained by the forward-built model (one term added at a time and a Chi-square test used to assess whether the addition of the new ASV term significantly improved the model). A handful of taxon abundances significanty predicted B*a*P exposure, however they did not always match in direction between the two data sets. Other taxa were only significant in one data set or the other (Figure 6).
+
+```{r logit-glms-dmsSplit-plot, fig.width=14, fig.height=9}
+taxa.tbl <- taxa.data.table(ps, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+
+plot.dt <- lapply(1:nrow(glm.dmsSplit.res.dt[p.value <= 0.05]), function(i) {
+  asv <- glm.dmsSplit.res.dt[p.value <= 0.05][i][["term"]]
+  sig.set <- glm.dmsSplit.res.dt[p.value <= 0.05][i][["data.set"]]
+  if (sig.set == "dissected") {
+    smpl.dt <- dissect.smpl.dt[, .(Sample, OriginID, BaP.Treat, Dissect.Whole)]
+    asv.dt <- dissect.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  } else {
+    smpl.dt <- whole.smpl.dt[, .(Sample, OriginID, BaP.Treat, Dissect.Whole)]
+    asv.dt <- whole.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  }
+  return(smpl.dt[asv.dt])
+}) %>% 
+  rbindlist() %>% 
+  merge(., taxa.tbl, by = "ASV")
+all.impt.dt0 <- rbind(
+  whole.only.impt.dt, 
+  dissect.only.impt.dt
+)
+all.impt.dt <- all.impt.dt0[, .(Mean.impt = mean(Importance)), by = "ASV"]
+setkey(all.impt.dt, ASV)
+plot.dt[, BaP.Treat := ifelse(BaP.Treat == "control", 0, 1)]
+plot.dt[, Facet.lab := paste(Genus, ASV, sep = "|")]
+uniq.facet.labs <- unique(plot.dt[, .(ASV, Facet.lab)])
+setkey(uniq.facet.labs, ASV)
+facet.levels <- uniq.facet.labs[
+  all.impt.dt[uniq.facet.labs$ASV][order(Mean.impt, decreasing = T)]$ASV
+]$Facet.lab
+plot.dt[, Facet.lab := factor(Facet.lab, levels = facet.levels)]
+# uniq.terms <- unique(glm.kitsSplit.res.dt[p.value <= 0.05]$term)
+set.size <- ceiling(length(facet.levels) / 3)
+subplots <- NULL
+cap <- "Plots of individual taxon abundances predicting BaP treatment and binomial regression lines."
+subplots[[1]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[1:set.size]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Dissect.Whole ~ Facet.lab, scales = "free_x") + 
+  panel_border() +
+  theme(axis.title = element_blank())
+
+subplots[[2]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[(set.size + 1):(2 * set.size)]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Dissect.Whole ~ Facet.lab, scales = "free_x") + 
+  labs(y = "Treatment") + 
+  panel_border() +
+  theme(axis.title.x = element_blank())
+
+subplots[[3]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[(2 * set.size + 1):length(facet.levels)]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Dissect.Whole ~ Facet.lab, scales = "free_x") + 
+  labs(x = "ASV abundance") + 
+  panel_border() +
+  theme(axis.title.y = element_blank())
+
+plot.file1 <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1, 
+    "_logisticGLMs_splitDMs_allPlots_rarefiedCounts",
+    fig.ext
+  )
+)
+plot_grid(plotlist = subplots, ncol = 1, align = "v", axis = "l") %>%
+  ggsave(
+    filename = plot.file1,
+    width = fig.wd * 4.1,
+    height = fig.ht * 2,
+    dpi = fig.dpi
+  )
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+### CLR
+
+```{r logit-glm-clr-dmsSplit}
+dm.ids <- setNames(c("dissect", "whole"), c("dissected", "whole fish"))
+mod.dt.list <- lapply(setNames(dm.ids, dm.ids), function(dm) {
+  asvs.dt <- get(paste0(dm, ".only.clr.ps")) %>%
+    otu.data.table() %>%
+    setkeyv(smpl.col.name)
+  smpl.dt <- get(paste0(dm, ".only.clr.ps")) %>%
+    sample.data.table() %>%
+    setkeyv(smpl.col.name)
+  return(smpl.dt[asvs.dt])
+})
+set.seed(user.seed)
+glm.res.clr.dt.file <- file.path(
+  dirs$save, 
+  "dt_subsampled_sigImpt_ASVs_logitGLM_clr_results_splitDMs.rds"
+)
+glm.dmsSplit.clr.res.dt <- redo.if("logitGLMs", glm.res.clr.dt.file, {
+  lapply(dm.ids, function(dm) {
+    ASVs <- dms.sig.impt.taxa.dt[
+      order(Mean.Impt, decreasing = T, na.last = T)
+    ]$ASV
+    ASVs <- ASVs[ASVs %in% names(mod.dt.list[[dm]])]
+    idx <- 0
+    p.value <- 1
+    curr.glm <- NULL
+    while (p.value > 0.05 & idx < length(ASVs)) {
+      idx <- idx + 1
+      curr.glm <-  glm(
+        as.formula(paste("BaP.Treat ~", ASVs[idx])), 
+        family = "binomial",
+        data = mod.dt.list[[dm]]
+      )
+      p.value <- tidy(curr.glm)$p.value[2]
+    }
+    for (i in (idx + 1):length(ASVs)) {
+      cat(i, sep = "\n")
+      new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+      new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+      if (is.na(new.p)) {
+        next
+      } else {
+        if (new.p <= 0.05) {
+          curr.glm <- new.glm
+        } else {
+          next
+        }
+      }
+    }
+    res <- Anova(curr.glm, type = 2) %>%
+      tidy() %>%
+      mutate(data.set = names(which(dm.ids == dm)), .before = 1)  %>%
+      as.data.table() %>%
+      setkeyv("term")
+    return(res)
+  }) %>% rbindlist()
+})
+setkey(glm.dmsSplit.clr.res.dt, term)
+glm.dmsSplit.clr.res.dt[, sig := ifelse(p.value <= 0.05, "*", "")]
+table.file <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppTbl_", 
+    tracking.env$supp.tbl.count + 1, 
+    "_logisticGLMs_splitDMs_clrCounts.html"
+  )
+)
+caption <- "Results of two binomial GLM models (one for each dissection method), built in a serial, forward stepwise manner predicting BaP treatment from individual ASV abundances."
+flextable(glm.dmsSplit.clr.res.dt[order(data.set)]) %>%
+  set_caption(caption = supp.tbl.caption(caption)) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+
+```
+
+```{r logit-glms-clr-dmsSplit-plot, fig.width=14, fig.height=9}
+taxa.tbl <- taxa.data.table(ps.clr, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+
+plot.dt <- lapply(1:nrow(glm.dmsSplit.clr.res.dt[p.value <= 0.05]), function(i) {
+  asv <- glm.dmsSplit.clr.res.dt[p.value <= 0.05][i][["term"]]
+  sig.set <- glm.dmsSplit.clr.res.dt[p.value <= 0.05][i][["data.set"]]
+  if (sig.set == "dissected") {
+    smpl.dt <- dissect.clr.smpl.dt[
+      , .(Sample, OriginID, BaP.Treat, Dissect.Whole)
+    ]
+    asv.dt <- dissect.clr.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  } else {
+    smpl.dt <- whole.clr.smpl.dt[, .(Sample, OriginID, BaP.Treat, Dissect.Whole)]
+    asv.dt <- whole.clr.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  }
+  return(smpl.dt[asv.dt])
+}) %>% 
+  rbindlist() %>% 
+  merge(., taxa.tbl, by = "ASV")
+all.impt.clr.dt0 <- rbind(
+  whole.only.clr.impt.dt, 
+  dissect.only.clr.impt.dt
+)
+all.impt.clr.dt <- all.impt.clr.dt0[, .(Mean.impt = mean(Importance)), by = "ASV"]
+setkey(all.impt.clr.dt, ASV)
+plot.dt[, BaP.Treat := ifelse(BaP.Treat == "control", 0, 1)]
+plot.dt[, Facet.lab := paste(Genus, ASV, sep = "|")]
+uniq.facet.labs <- unique(plot.dt[, .(ASV, Facet.lab)])
+setkey(uniq.facet.labs, ASV)
+facet.levels <- uniq.facet.labs[
+  all.impt.clr.dt[uniq.facet.labs$ASV][order(Mean.impt, decreasing = T)]$ASV
+]$Facet.lab
+plot.dt[, Facet.lab := factor(Facet.lab, levels = facet.levels)]
+# uniq.terms <- unique(glm.kitsSplit.clr.res.dt[p.value <= 0.05]$term)
+set.size <- ceiling(length(facet.levels) / 6)
+cap <- "Plots of individual taxon abundances predicting BaP treatment and binomial regression lines."
+rows.dt <- data.table(
+  row = 1:ceiling(length(facet.levels) / set.size),
+  idx = 1:ceiling(length(facet.levels) / set.size) - 1
+)
+plot.list <- lapply(1:nrow(rows.dt), function(i) {
+  start <- rows.dt$idx[i] * set.size + 1
+  end <- rows.dt$row[i] * set.size
+  p <- ggplot(
+    plot.dt[Facet.lab %in% facet.levels[start:end]], 
+    aes(x = Abund, y = BaP.Treat)
+  ) + 
+    stat_smooth(
+      method = "glm", 
+      method.args = list(family = "binomial"), 
+      formula = y ~ x, 
+      se = F,
+      color = "gray40"
+    ) + 
+    scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+    geom_quasirandom(groupOnX = FALSE, size = 1) + 
+    facet_grid(Dissect.Whole ~ Facet.lab, scales = "free_x") + 
+    panel_border()
+  if (i == floor(median(rows.dt$row))) {
+    p <- p + labs(y = "Treatment") + theme(axis.title.x = element_blank())
+  } else if (i == max(rows.dt$row)) {
+    p <- p + labs(x = "ASV abundance") + theme(axis.title.y = element_blank())
+  } else {
+    p <- p + theme(axis.title = element_blank())
+  }
+  return(p)
+})
+
+plot.file1 <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1, 
+    "_logisticGLMs_splitDMs_allPlots_clrCounts",
+    fig.ext
+  )
+)
+plot_grid(
+  plotlist = plot.list, 
+  rel_heights = c(2, 1, 2, 2, 2, 1),
+  ncol = 1, 
+  align = "v", 
+  axis = "l"
+  ) %>%
+  ggsave(
+    filename = plot.file1,
+    width = fig.wd * 2,
+    height = fig.ht * 4,
+    dpi = fig.dpi
+  )
+main.fig.max <- 8
+plot.file2 <- file.path(
+  dirs$main.figs,
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1, 
+    "_logisticGLMs_splitDMs_top", main.fig.max, "abundPlots_clrCounts",
+    fig.ext
+  )
+)
+{ 
+  ggplot(
+    plot.dt[Facet.lab %in% facet.levels[1:main.fig.max]], 
+    aes(x = Abund, y = BaP.Treat)
+  ) + 
+    stat_smooth(
+      method = "glm", 
+      method.args = list(family = "binomial"), 
+      formula = y ~ x, 
+      se = F,
+      color = "gray40"
+    ) + 
+    scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+    geom_quasirandom(groupOnX = FALSE, size = 1) + 
+    facet_grid(Dissect.Whole ~ Facet.lab, scales = "free_x") + 
+    panel_border() +
+    theme(axis.title = element_blank())
+} %>%
+  ggsave(
+    filename = plot.file2,
+    width = fig.wd * 3,
+    height = fig.ht * 0.8,
+    dpi = fig.dpi
+  )
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+tracking.env$fig.count <- tracking.env$fig.count + 1
+```
+
+## Logit GLMs: Extraction Kits
+
+```{r logit-glms-kitsSplit}
+kit.ids <- setNames(
+  c("bt", "ns", "ps"), 
+  c("Blood & Tissue", "NucleoSpin", "PowerSoil")
+)
+mod.dt.list <- lapply(setNames(kit.ids, kit.ids), function(kit) {
+  asvs.dt <- get(paste0(kit, ".only.ps")) %>%
+    otu.data.table() %>%
+    setkeyv(smpl.col.name)
+  smpl.dt <- get(paste0(kit, ".only.ps")) %>%
+    sample.data.table() %>%
+    setkeyv(smpl.col.name)
+  return(smpl.dt[asvs.dt])
+})
+set.seed(user.seed)
+glm.res.dt.file <- file.path(
+  dirs$save, 
+  "dt_subsampled_sigImpt_ASVs_logitGLM_results_splitKits.rds"
+)
+glm.kitsSplit.res.dt <- redo.if("logitGLMs", glm.res.dt.file, {
+  lapply(kit.ids, function(kit) {
+    ASVs <- kits.sig.impt.taxa.dt[
+      order(Mean.Impt, decreasing = T, na.last = T)
+    ]$ASV
+    ASVs <- ASVs[ASVs %in% names(mod.dt.list[[kit]])]
+    idx <- 0
+    p.value <- 1
+    curr.glm <- NULL
+    while(p.value > 0.05 & idx < length(ASVs)) {
+      idx <- idx + 1
+      curr.glm <-  glm(
+        as.formula(paste("BaP.Treat ~", ASVs[idx])), 
+        family = "binomial",
+        data = mod.dt.list[[kit]]
+      )
+      p.value <- tidy(curr.glm)$p.value[2]
+    }
+    for (i in (idx + 1):length(ASVs)) {
+      cat(i, sep = "\n")
+      new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+      new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+      if (is.na(new.p)) {
+        next
+      } else {
+        if (new.p <= 0.05) {
+          curr.glm <- new.glm
+        } else {
+          next
+        }
+      }
+    }
+    res <- Anova(curr.glm, type = 2) %>%
+      tidy() %>%
+      mutate(data.set = names(which(kit.ids == kit)), .before = 1)  %>%
+      as.data.table() %>%
+      setkeyv("term")
+    return(res)
+  }) %>% rbindlist()
+})
+setkey(glm.kitsSplit.res.dt, term)
+glm.kitsSplit.res.dt[, sig := ifelse(p.value <= 0.05, "*", "")]
+table.file <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppTbl_", 
+    tracking.env$supp.tbl.count + 1, 
+    "_logisticGLMs_splitEKs_rarefiedCounts.html"
+  )
+)
+caption <- "Results of three binomial GLM models (one for each extraction kit), built in a serial, forward stepwise manner predicting BaP treatment from individual ASV abundances."
+flextable(glm.kitsSplit.res.dt[order(data.set)]) %>%
+  set_caption(caption = supp.tbl.caption(caption)) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+```{r logit-glms-kitSplit-plot, fig.width=14, fig.height=10}
+taxa.tbl <- taxa.data.table(ps, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+
+plot.dt <- lapply(1:nrow(glm.kitsSplit.res.dt[p.value <= 0.05]), function(i) {
+  asv <- glm.kitsSplit.res.dt[p.value <= 0.05][i][["term"]]
+  sig.set <- glm.kitsSplit.res.dt[p.value <= 0.05][i][["data.set"]]
+  if (sig.set == "Blood & Tissue") {
+    smpl.dt <- bt.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+    asv.dt <- bt.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  } else if (sig.set == "NucleoSpin") {
+    smpl.dt <- ns.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+    asv.dt <- ns.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  } else {
+    smpl.dt <- ps.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+    asv.dt <- ps.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+      melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+      setkeyv(smpl.col.name)
+  }
+  return(smpl.dt[asv.dt])
+}) %>% 
+  rbindlist() %>% 
+  merge(., taxa.tbl, by = "ASV")
+all.impt.dt0 <- rbind(
+  bt.only.impt.dt, 
+  ns.only.impt.dt, 
+  ps.only.impt.dt
+)
+all.impt.dt <- all.impt.dt0[, .(Mean.impt = mean(Importance)), by = "ASV"]
+setkey(all.impt.dt, ASV)
+plot.dt[, BaP.Treat := ifelse(BaP.Treat == "control", 0, 1)]
+plot.dt[, Facet.lab := paste(Genus, ASV, sep = "|")]
+uniq.facet.labs <- unique(plot.dt[, .(ASV, Facet.lab)])
+setkey(uniq.facet.labs, ASV)
+facet.levels <- uniq.facet.labs[
+  all.impt.dt[uniq.facet.labs$ASV][order(Mean.impt, decreasing = T)]$ASV
+]$Facet.lab
+plot.dt[, Facet.lab := factor(Facet.lab, levels = facet.levels)]
+# uniq.terms <- unique(glm.kitsSplit.res.dt[p.value <= 0.05]$term)
+set.size <- ceiling(length(facet.levels) / 3)
+subplots <- NULL
+cap <- "Plots of individual taxon abundances predicting BaP treatment and binomial regression lines."
+subplots[[1]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[1:set.size]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Extraction.Kit ~ Facet.lab, scales = "free_x") + 
+  panel_border() + 
+  theme(axis.title = element_blank())
+subplots[[2]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[(set.size + 1):(2 * set.size)]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Extraction.Kit ~ Facet.lab, scales = "free_x") + 
+  labs(y = "Treatment") + 
+  panel_border() + 
+  theme(axis.title.x = element_blank())
+subplots[[3]] <- ggplot(
+  plot.dt[Facet.lab %in% facet.levels[(2 * set.size + 1):length(facet.levels)]], 
+  aes(x = Abund, y = BaP.Treat)
+) + 
+  stat_smooth(
+    method = "glm", 
+    method.args = list(family = "binomial"), 
+    formula = y ~ x, 
+    se = F,
+    color = "gray40"
+  ) + 
+  scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+  geom_quasirandom(groupOnX = FALSE, size = 1) + 
+  facet_grid(Extraction.Kit ~ Facet.lab, scales = "free_x") + 
+  labs(x = "ASV abundance") + 
+  panel_border() + 
+  theme(axis.title.y = element_blank())
+
+plot.file1 <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1, 
+    "_logisticGLMs_splitEKs_allPlots_rarefiedCounts",
+    fig.ext
+  )
+)
+plot_grid(plotlist = subplots, ncol = 1, align = "v", axis = "l") %>%
+  ggsave(
+    filename = plot.file1,
+    width = fig.wd * 4.1,
+    height = fig.ht * 2,
+    dpi = fig.dpi
+  )
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+```
+
+### CLR
+
+```{r logit-glms-clr-kitsSplit}
+kit.ids <- setNames(
+  c("bt", "ns", "ps"), 
+  c("Blood & Tissue", "NucleoSpin", "PowerSoil")
+)
+mod.dt.list <- lapply(setNames(kit.ids, kit.ids), function(kit) {
+  asvs.dt <- get(paste0(kit, ".only.clr.ps")) %>%
+    otu.data.table() %>%
+    setkeyv(smpl.col.name)
+  smpl.dt <- get(paste0(kit, ".only.clr.ps")) %>%
+    sample.data.table() %>%
+    setkeyv(smpl.col.name)
+  return(smpl.dt[asvs.dt])
+})
+set.seed(user.seed)
+glm.clr.res.dt.file <- file.path(
+  dirs$save, 
+  "dt_subsampled_sigImpt_ASVs_logitGLM_clr_results_splitKits.rds"
+)
+glm.kitsSplit.clr.res.dt <- redo.if("logitGLMs", glm.clr.res.dt.file, {
+  lapply(kit.ids, function(kit) {
+    ASVs <- kits.sig.impt.taxa.dt[
+      order(Mean.Impt, decreasing = T, na.last = T)
+    ]$ASV
+    ASVs <- ASVs[ASVs %in% names(mod.dt.list[[kit]])]
+    idx <- 0
+    p.value <- 1
+    curr.glm <- NULL
+    while(p.value > 0.05 & idx < length(ASVs)) {
+      idx <- idx + 1
+      curr.glm <-  glm(
+        as.formula(paste("BaP.Treat ~", ASVs[idx])), 
+        family = "binomial",
+        data = mod.dt.list[[kit]]
+      )
+      p.value <- tidy(curr.glm)$p.value[2]
+    }
+    for (i in (idx + 1):length(ASVs)) {
+      cat(i, sep = "\n")
+      new.glm <- update(curr.glm, as.formula(paste(". ~ . +", ASVs[i])))
+      new.p <- tidy(anova(curr.glm, new.glm, test = "Chisq"))$p.value[2]
+      if (is.na(new.p)) {
+        next
+      } else {
+        if (new.p <= 0.05) {
+          curr.glm <- new.glm
+        } else {
+          next
+        }
+      }
+    }
+    res <- Anova(curr.glm, type = 2) %>%
+      tidy() %>%
+      mutate(data.set = names(which(kit.ids == kit)), .before = 1)  %>%
+      as.data.table() %>%
+      setkeyv("term")
+    return(res)
+  }) %>% rbindlist()
+})
+setkey(glm.kitsSplit.clr.res.dt, term)
+glm.kitsSplit.clr.res.dt[, sig := ifelse(p.value <= 0.05, "*", "")]
+table.file <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppTbl_", 
+    tracking.env$supp.tbl.count + 1, 
+    "_logisticGLMs_splitEKs_clrCounts.html"
+  )
+)
+caption <- "Results of three binomial GLM models (one for each extraction kit), built in a serial, forward stepwise manner predicting BaP treatment from individual ASV abundances."
+flextable(glm.kitsSplit.clr.res.dt[order(data.set)]) %>%
+  set_caption(caption = supp.tbl.caption(caption)) %>%
+  align(j = c(1, 6), align = "left") %>%
+  align(j = 2:5, align = "right") %>%
+  colformat_double(j = 3, digits = 2) %>%
+  colformat_double(j = 5, digits = 3) %>%
+  merge_v(j = 1) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+```
+
+```{r logit-glms-clr-kitSplit-plot, fig.width=14, fig.height=10}
+taxa.tbl <- taxa.data.table(ps.clr, taxon.column.name = "ASV")
+taxa.tbl[, Taxon := NULL]
+taxa.tbl[, Kingdom := NULL]
+setkey(taxa.tbl, ASV)
+
+plot.dt <- lapply(
+  1:nrow(glm.kitsSplit.clr.res.dt[p.value <= 0.05]), 
+  function(i) {
+    asv <- glm.kitsSplit.clr.res.dt[p.value <= 0.05][i][["term"]]
+    sig.set <- glm.kitsSplit.clr.res.dt[p.value <= 0.05][i][["data.set"]]
+    if (sig.set == "Blood & Tissue") {
+      smpl.dt <- bt.clr.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+      asv.dt <- bt.clr.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+        melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+        setkeyv(smpl.col.name)
+    } else if (sig.set == "NucleoSpin") {
+      smpl.dt <- ns.clr.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+      asv.dt <- ns.clr.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+        melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+        setkeyv(smpl.col.name)
+    } else {
+      smpl.dt <- ps.clr.smpl.dt[, .(Sample, OriginID, BaP.Treat, Extraction.Kit)]
+      asv.dt <- ps.clr.asvs.dt[, .SD, .SDcols = c("Sample", asv)] %>%
+        melt(measure.var = asv, variable.name = "ASV", value.name = "Abund") %>%
+        setkeyv(smpl.col.name)
+    }
+    return(smpl.dt[asv.dt])
+  }) %>% 
+  rbindlist() %>% 
+  merge(., taxa.tbl, by = "ASV")
+all.impt.clr.dt0 <- rbind(
+  bt.only.clr.impt.dt, 
+  ns.only.clr.impt.dt, 
+  ps.only.clr.impt.dt
+)
+all.impt.clr.dt <- all.impt.clr.dt0[, .(Mean.impt = mean(Importance)), by = "ASV"]
+setkey(all.impt.clr.dt, ASV)
+plot.dt[, BaP.Treat := ifelse(BaP.Treat == "control", 0, 1)]
+plot.dt[, Facet.lab := paste(Genus, ASV, sep = "|")]
+uniq.facet.labs <- unique(plot.dt[, .(ASV, Facet.lab)])
+setkey(uniq.facet.labs, ASV)
+facet.levels <- uniq.facet.labs[
+  all.impt.clr.dt[uniq.facet.labs$ASV][order(Mean.impt, decreasing = T)]$ASV
+]$Facet.lab
+plot.dt[, Facet.lab := factor(Facet.lab, levels = facet.levels)]
+# uniq.terms <- unique(glm.kitsSplit.clr.res.dt[p.value <= 0.05]$term)
+set.size <- ceiling(length(facet.levels) / 5)
+cap <- "Plots of individual taxon abundances predicting BaP treatment and binomial regression lines."
+rows.dt <- data.table(
+  row = 1:ceiling(length(facet.levels) / set.size),
+  idx = 1:ceiling(length(facet.levels) / set.size) - 1
+)
+plot.list <- lapply(1:nrow(rows.dt), function(i) {
+  start <- rows.dt$idx[i] * set.size + 1
+  end <- rows.dt$row[i] * set.size
+  p <- ggplot(
+    plot.dt[Facet.lab %in% facet.levels[start:end]], 
+    aes(x = Abund, y = BaP.Treat)
+  ) + 
+    stat_smooth(
+      method = "glm", 
+      method.args = list(family = "binomial"), 
+      formula = y ~ x, 
+      se = F,
+      color = "gray40"
+    ) + 
+    scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+    geom_quasirandom(groupOnX = FALSE, size = 1) + 
+    facet_grid(Extraction.Kit ~ Facet.lab, scales = "free_x") + 
+    panel_border()
+  if (i == floor(median(rows.dt$row))) {
+    p <- p + labs(y = "Treatment") + theme(axis.title.x = element_blank())
+  } else if (i == max(rows.dt$row)) {
+    p <- p + labs(x = "ASV abundance") + theme(axis.title.y = element_blank())
+  } else {
+    p <- p + theme(axis.title = element_blank())
+  }
+  return(p)
+})
+
+plot.file1 <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppFig_", 
+    tracking.env$supp.fig.count + 1, 
+    "_logisticGLMs_splitEKs_allPlots_clrCounts",
+    fig.ext
+  )
+)
+plot_grid(plotlist = plot.list, ncol = 1, align = "v", axis = "l") %>%
+  ggsave(
+    filename = plot.file1,
+    width = fig.wd * 2,
+    height = fig.ht * 4,
+    dpi = fig.dpi
+  )
+
+main.fig.max <- 8
+plot.file2 <- file.path(
+  dirs$main.figs,
+  paste0(
+    "fig_", 
+    tracking.env$fig.count + 1, 
+    "_logisticGLMs_splitEKs_top", main.fig.max, "abundPlots_clrCounts",
+    fig.ext
+  )
+)
+
+{ 
+  ggplot(
+    plot.dt[Facet.lab %in% facet.levels[1:main.fig.max]], 
+    aes(x = Abund, y = BaP.Treat)
+  ) + 
+    stat_smooth(
+      method = "glm", 
+      method.args = list(family = "binomial"), 
+      formula = y ~ x, 
+      se = F,
+      color = "gray40"
+    ) + 
+    scale_y_continuous(breaks = c(0, 1), labels = c("control", "BaP")) + 
+    geom_quasirandom(groupOnX = FALSE, size = 1) + 
+    facet_grid(Extraction.Kit ~ Facet.lab, scales = "free_x") + 
+    panel_border() + 
+    theme(axis.title = element_blank())
+} %>%
+  ggsave(
+    filename = plot.file2,
+    width = fig.wd * 3,
+    height = fig.ht,
+    dpi = fig.dpi
+  )
+tracking.env$supp.fig.count <- tracking.env$supp.fig.count + 1
+tracking.env$fig.count <- tracking.env$fig.count + 1
+```
+
+We ran an identical analysis pipeline for each extraction kit producing three total models (Table 6). As with the dissection methods models, a handful of taxon abundances significanty predicted B*a*P exposure, however there were no taxa that were statistically significant in for more than a single extraction kit data set (Figure 7).
+
+
+## Supplemental Tables and Figures
+
+### Sample breakdowns
+
+Some zebrafish died prior to dissection (~20%), but surprisingly control fish died at a greater rate that those exposed to B*a*P (28% of control fish, only 12% of exposed fish). After sequencing, samples were futher reduced by quality control of sequences and the rarefaction cutoff (see caption of Table 1 below). The following tables represent *sequencing samples* not zebrafish samples as all samples went through both single and triplicate PCR.
+
+```{r sample-tables}
+table.file <- file.path(
+  dirs$supp.figs,
+  paste0(
+    "suppTbl_",
+    tracking.env$supp.tbl.count + 1,
+    "_sample_breakdown.html"
+  )
+)
+caption1 <- paste("Full breakdown of samples that passed through pre-processing: Including water and blank controls, 758 samples (representing 379 zebrafish microbiomes) were sequenced over two runs. Of those,", nsamples(ps0), "were sucessfully run through the dada2 pipeline. Setting a minimum cutoff of", rarefaction.minimum, "for rarefaction,", nsamples(ps), "were kept. The breakdown of these samples is in this table.")
+sample.dt[
+  , .(Count = .N), 
+  by = c("BaP.Treat", "Dissect.Whole", "Extraction.Kit")
+] %>%
+  set_names(c("Treatment", "Dissection Method", "Extraction Kit", "Count")) %>%
+  flextable() %>%
+  set_caption(caption = supp.tbl.caption(caption1)) %>%
+  merge_v(j = 1:2) %>% 
+  autofit() %>%
+  save_as_html(path = table.file)
+system(paste("open", table.file, "-a /Applications/Microsoft\\ Excel.app"))
+
+# caption2 <- "Samples by BaP treatment only"
+# sample.dt[, .(Count = .N), by = "BaP.Treat"] %>% 
+#   kable(caption = table.caption(caption2), format = "html") %>%
+#   kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# caption3 <- "Samples by dissection method only"
+# sample.dt[, .(Count = .N), by = "Dissect.Whole"] %>% 
+#   kable(caption = table.caption(caption3), format = "html") %>%
+#   kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# caption4 <- "Samples by extraction kit only"
+# sample.dt[, .(Count = .N), by = "Extraction.Kit"] %>% 
+#   kable(caption = table.caption(caption4), format = "html") %>%
+#   kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# caption5 <- "Samples by dissection method BaP and treatment"
+# sample.dt[, .(Count = .N), keyby = c("Dissect.Whole", "BaP.Treat")] %>% 
+#   kable(caption = table.caption(caption5), format = "html") %>%
+#   kable_styling(bootstrap_options = "condensed", full_width = FALSE) %>% 
+#   collapse_rows(columns = 1)
+```
+
+```{r EK-dbRDA-pairwise-anovas-print}
+anova.dt <- lapply(beta.methods, function(beta) {
+  # kit <- kits[1]
+  kit.dt <- lapply(kits, function(kit) {
+    dist.mat <- dist.list[[beta]] %>%
+      dist_subset(idx = sample_names(kit.ps.list[[kit]]))
+    return(
+      capscale(
+        dist.mat ~ BaP.Treat,
+        data = sample.data.frame(kit.ps.list[[kit]])
+      ) %>%
+        anova(by = "term") %>%
+        tidy() %>%
+        mutate(metric = beta, kit = kit, .before = 1) %>%
+        as.data.table()
+    )
+  }) %>% rbindlist()
+}) %>% rbindlist()
+
+anova.dt[, Adj.pval := p.adjust(p.value, method = "bonferroni")] 
+anova.dt[
+  , 
+  `:=`(
+    sig = ifelse(Adj.pval <= 0.05, "*", ""),
+    term = stri_replace_all_fixed(term, "BaP.Treat", "BaP Treatment")
+  )
+] %>% 
+  flextable() %>%
+  set_caption(
+    caption = supp.tbl.caption(
+      paste0(
+        "Pairwise extraction kit PERMANOVA results (n = ", 
+        nsamples(kit.ps.list[[1]]), " per kit)"
+      )
+    )
+  ) %>%
+  align(j = c(1, 2, 9), align = "left") %>%
+  align(j = 2:6, align = "right") %>%
+  colformat_double(j = 5:6, digits = 2) %>%
+  colformat_double(j = 7:8, digits = 3) %>%
+  merge_v(j = 1:2) %>% 
+  autofit()
+```
+
+```{r DM-dbRDA-pairwise-anovas-print}
+# beta <- beta.methods[2]
+anova.dt <- lapply(beta.methods, function(beta) {
+  dm.dt <- lapply(dms, function(dm) {
+    dist.mat <- dist.list[[beta]] %>%
+      dist_subset(idx = sample_names(dm.ps.list[[dm]]))
+    return(
+      capscale(
+        dist.mat ~ BaP.Treat,
+        data = sample.data.frame(dm.ps.list[[dm]])
+      ) %>%
+        anova(by = "term") %>%
+        tidy() %>%
+        mutate(metric = beta, dissection.method = dm, .before = 1) %>%
+        as.data.table()
+    )
+  }) %>% rbindlist()
+}) %>% rbindlist()
+anova.dt[, Adj.pval := p.adjust(p.value, method = "bonferroni")] 
+anova.dt[
+  , 
+  `:=`(
+    sig = ifelse(Adj.pval <= 0.05, "*", ""),
+    term = stri_replace_all_fixed(term, "BaP.Treat", "BaP Treatment")
+  )
+] %>% 
+  flextable() %>%
+  set_caption(
+    caption = supp.tbl.caption(
+      paste0(
+        "Pairwise dissection method PERMANOVA results (n = ", 
+        nsamples(dm.ps.list[[1]]), " per method)"
+      )
+    )
+  ) %>%
+  align(j = c(1, 2, 9), align = "left") %>%
+  align(j = 2:6, align = "right") %>%
+  colformat_double(j = 5:6, digits = 2) %>%
+  colformat_double(j = 7:8, digits = 3) %>%
+  merge_v(j = 1:2) %>% 
+  autofit()
+```
+
+![](Plots/lefse_results_heatmap.png)
+
